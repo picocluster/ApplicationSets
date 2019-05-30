@@ -29,7 +29,7 @@
           register: group
 
         - name: Reboot machine if this user was added to the docker group.
-          shell: "reboot now"
+          shell: "reboot"
           when: group.changed
       when: is_docker | failed
 
