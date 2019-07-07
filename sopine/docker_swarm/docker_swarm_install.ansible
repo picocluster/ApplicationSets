@@ -29,7 +29,7 @@
           register: group
 
         - name: Reboot machine if this user was added to the docker group.
-          shell: "reboot"
+          shell: "reboot now"
           when: group.changed
       when: is_docker | failed
 
@@ -80,7 +80,7 @@
             timeout: 10
 
         - name: Retrieve the swarm status and show it
-          shell: docker node ls
+          shell: ./swarm_status.sh
           register: swarm_status
 
         - debug: var=swarm_status.stdout_lines

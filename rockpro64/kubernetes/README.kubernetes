@@ -1,0 +1,68 @@
+FIRST RUN - RUn the following commands to configure the cluster.
+sh genKeys.sh
+ssh pc0
+exit
+
+The following command needs to be run reboot of the cluster to make sure iptables is routing between nodes properly. This needs to be run after the system starts up.
+sh setupIptablesKubernetes.sh
+
+
+Kubernetes is now setup and running. 
+
+You can verify by running the following command:
+kubectl get nodes
+
+Your output should look similar to this, depending on the number of nodes in your cluster:
+NAME      STATUS    ROLES     AGE       VERSION
+pc0       Ready     master    1d        v1.8.5
+pc1       Ready     <none>    1d        v1.8.5
+pc2       Ready     <none>    1d        v1.8.5
+pc3       Ready     <none>    1d        v1.8.5
+pc4       Ready     <none>    1d        v1.8.5
+
+Another helpful command shows you what is running on your Kubernetes system:
+kubectl get po --all-namespaces
+
+You should get output similar to the following:
+kube-system   etcd-pc0                      1/1       Running   16         1d
+kube-system   kube-apiserver-pc0            1/1       Running   17         1d
+kube-system   kube-controller-manager-pc0   1/1       Running   9          4h
+kube-system   kube-dns-66ffd5c588-4cvgv     3/3       Running   36         1d
+kube-system   kube-flannel-ds-jchxr         2/2       Running   25         3h
+kube-system   kube-flannel-ds-nsfl8         2/2       Running   25         3h
+kube-system   kube-flannel-ds-w6skw         2/2       Running   21         3h
+kube-system   kube-flannel-ds-xx6mj         2/2       Running   31         3h
+kube-system   kube-flannel-ds-ztpv7         2/2       Running   28         3h
+kube-system   kube-proxy-lswz2              1/1       Running   12         1d
+kube-system   kube-proxy-mhjf8              1/1       Running   12         1d
+kube-system   kube-proxy-vngb5              1/1       Running   12         1d
+kube-system   kube-proxy-wb9tc              1/1       Running   12         1d
+kube-system   kube-proxy-zf7dj              1/1       Running   13         1d
+kube-system   kube-scheduler-pc0            1/1       Running   16         1d
+
+DEMO
+run sh create_busybox_hypriot.sh
+
+This will set up a 3 demo pods running busybox.
+
+kubectl get endpoints hypriot
+
+Will give you the endpoints of the pods. You can use curl to test them.
+NAME      ENDPOINTS                                      AGE
+hypriot   10.244.2.14:80,10.244.3.17:80,10.244.4.18:80   2h
+
+curl 10.244.2.14
+<html>
+<head><title>Pi armed with Docker by Hypriot</title>
+  <body style="width: 100%; background-color: black;">
+    <div id="main" style="margin: 100px auto 0 auto; width: 800px;">
+      <img src="pi_armed_with_docker.jpg" alt="pi armed with docker" style="width: 800px">
+    </div>
+  </body>
+</html>
+
+if you don't get any output, then cancel the command and run the following and try again.
+sh setupIptablesKubernetes.sh
+
+Contact support@picocluster.com for any questions.
+

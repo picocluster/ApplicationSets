@@ -1,0 +1,17 @@
+---
+- hosts: localhost
+  become: yes
+
+  tasks:
+    # Remove the odroid user
+    - name: Remove the user odroid
+      user:
+        name: odroid
+        state: absent
+        remove: yes
+
+    - name: Remove odroid group
+      group:
+        name: odroid
+        state: absent
+

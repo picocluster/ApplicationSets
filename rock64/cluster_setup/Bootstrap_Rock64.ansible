@@ -1,0 +1,111 @@
+---
+- hosts: localhost
+  gather_facts: yes
+  become: yes
+
+  tasks:
+    # Add picocluster group and user and add sudo access
+    - name: Add picocluster group
+      group:
+        name: picocluster
+        state: present
+
+    - name: Add picocluster user
+      user:
+        name: picocluster
+        password: $6$AMuboui5it$k13q1IN29h1/9Sp1FZETBax1xSgOkpSn.rXkUxltKo13pAr/PfDLt4WVnKdHiwCf92o0ZL19Hj0R2PaUYo1XH.
+        comment: PicoCluster LLC
+        group: picocluster
+        home: /home/picocluster
+        shell: /bin/bash
+
+    - name: Append picocluster to rock64 groups
+      user:
+        name: picocluster
+        groups: adm,sudo,audio,video,plugdev,input,ssh
+        append: yes
+
+    - name: Add sudo for picocluster
+      lineinfile:
+        dest: /etc/sudoers
+        regexp: '^%picocluster'
+        line: 'picocluster ALL=(ALL) NOPASSWD: ALL'
+        state: present
+
+    - name: Make sure the Pictures directory exists
+      file:
+        path: /home/picocluster/Pictures
+        state: directory
+        owner: picocluster
+        group: picocluster
+        create: yes
+        mode: '0755'
+
+    - name: Pull down picocluster background image from github
+      get_url:
+        url: https://raw.githubusercontent.com/picocluster/ApplicationSets/master/cluster_setup/PicoCluster_Background.png
+        dest: /home/picocluster/Pictures/PicoCluster_Background.png
+        owner: picocluster
+        group: picocluster
+        mode: '0440'
+
+    # Configure network setting
+    - name: Change hostname to pc0
+      lineinfile:
+        dest: /etc/hostname
+        regexp: '^rock64'
+        line: 'pc0'
+        state: present
+
+    # Remove DHCP line
+    - name: Change hostname to pc0
+      lineinfile:
+        dest: /etc/network/interfaces.d/eth0
+        regexp: '^     dhcp4: true'
+        state: absent
+
+    - name: Add static network settings
+      blockinfile:
+        dest: /etc/netplan/eth0.yaml
+        regexp: '^     dhcp4: true'
+        block: |
+                dhcp4: false
+                dhcp6: false
+                addresses: [10.1.10.240/24]
+                gateway4: 10.1.10.1
+                nameservers:
+                  addresses: [8.8.8.8,10.1.10.1]
+
+    - name: Add host mappings to /etc/hosts
+      blockinfile:
+        path: /etc/hosts
+        block: |
+          {{ item.ip }} {{ item.name }}
+        marker: "# {mark} ANSIBLE MANAGED BLOCK {{ item.name }}"
+      with_items:
+      - { name: pc0, ip: 10.1.10.240 }
+      - { name: pc1, ip: 10.1.10.241 }
+      - { name: pc2, ip: 10.1.10.242 }
+      - { name: pc3, ip: 10.1.10.243 }
+      - { name: pc4, ip: 10.1.10.244 }
+
+    - name: Add our ansible hosts setup
+      blockinfile:
+        dest: /etc/ansible/hosts
+        marker: "# {mark} ANSIBLE MANAGED BLOCK HOSTS"
+        block: |
+          # Ungrouped
+          pc[0:4]
+
+          # cluster node
+          [cluster]
+          pc[0:4]
+
+          # master
+          [master]
+          pc0
+
+          # worker
+          [worker]
+          pc[1:4]
+

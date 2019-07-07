@@ -1,0 +1,16 @@
+---
+- hosts: localhost
+  become: yes
+
+  tasks:
+    - name: Remove the user
+      user:
+        name: armbian
+        state: absent
+        remove: yes
+
+    - name: Remove group
+      group:
+        name: armbian
+        state: absent
+

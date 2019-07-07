@@ -1,0 +1,15 @@
+---
+- hosts: cluster
+  gather_facts: no
+  become: yes
+
+  tasks:
+    - name: Remove extra packages and applications
+      command: 'docker swarm leave --force'
+      ignore_errors: True
+
+    - name: Remove extra packages and applications
+      apt: name={{ item }} state=absent purge=yes
+      with_items:
+        - docker*
+
