@@ -93,9 +93,18 @@
               wait_for: 
                 timeout: 10
 
-            - name: Reboot machine if swapfile status changed
+            - name: Reboot workers if cgroups or swapfile changed
               shell: "reboot"
-              when: swapfile.changed
+              when: swapfile.changed and 'worker' in group_names
+
+            - name: Wait 10 seconds on master for workers to reboot
+              wait_for: 
+                timeout: 10
+              when: "'master' in group_names"
+
+            - name: Reboot master if cgroups or swapfile changed
+              shell: "reboot"
+              when: swapfile.changed and 'master' in group_names
 
       when: is_kubernetes is failed
 
@@ -136,7 +145,8 @@
 
             - name: Set up flannel networking
               shell: "curl -sSL https://rawgit.com/coreos/flannel/v0.11.0/Documentation/kube-flannel.yml | sed 's/amd64/arm64/g' | kubectl create -f -"
-              when: stat_result.stat.exists == False
+              ignore_errors: True
+
           become: no
           when: "'master' in group_names"
 
