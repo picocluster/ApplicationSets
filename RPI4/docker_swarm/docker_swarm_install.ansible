@@ -1,0 +1,88 @@
+---
+- hosts: cluster
+  become: yes
+  vars:
+      join_command_location: "./join_command.out"
+
+  tasks:
+    - name: Check to see if Docker is already installed
+      shell: dpkg-query -W 'docker'
+      ignore_errors: True
+      register: is_docker
+
+    # Skip if Docker is already installed
+    - block:
+        - name: Make sure certificates are installed and updated
+          apt: name={{ item }} state=present
+          with_items:
+            - apt-transport-https
+            - ca-certificates
+
+        - name: Install Docker
+          shell: curl -sSL https://get.docker.com/ | sh
+
+        - name: Append picocluster to docker Group
+          user:
+            name: picocluster
+            groups: docker
+            append: yes
+          register: group
+
+        - name: Reboot machine if this user was added to the docker group.
+          shell: "reboot"
+          when: group.changed
+      when: is_docker | failed
+
+    - name: Check to see if Docker is installed
+      command: "docker"
+      ignore_errors: True
+      register: docker_response
+
+    # Skip if Docker is already installed
+    - block:
+        # Create Swarm on Master and save join command to file
+        - block:
+            - name: Init docker swarm
+              command: 'docker swarm init --advertise-addr "{{ ansible_default_ipv4.address }}"'
+              ignore_errors: True
+
+            - name: Extract join command
+              command: docker swarm join-token worker
+              register: join_command
+
+            - name: Save join command
+              local_action: copy content={{ join_command.stdout_lines | last  | trim }} dest="{{ join_command_location }}"
+
+            - name: Copy join command to worker nodes 
+              synchronize:
+                src: "{{ join_command_location }}"
+                dest: "{{ join_command_location }}"
+          when: "'master' in group_names"
+
+        # Read the join command on the workers and join the swarm
+        - block:
+            - name: Read join command on worker nodes
+              debug: msg="{{ lookup('file', join_command_location) }}"
+              register: join_command_local
+              when: "'worker' in group_names"
+
+            - name: Join Workers to Swarm
+              command: "{{ join_command_local.msg }}"
+              when: "'worker' in group_names"
+          when: join_command is defined
+
+      when: (docker_response is defined) and (docker_response | success)
+
+    # Wait a few seconds, then print the output of the swarm status. All nodes should have joined.
+    - block:
+        - name: Wait 10 seconds
+          wait_for: 
+            timeout: 10
+
+        - name: Retrieve the swarm status and show it
+          shell: docker node ls
+          register: swarm_status
+
+        - debug: var=swarm_status.stdout_lines
+      when: "'master' in group_names"
+
