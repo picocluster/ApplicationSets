@@ -15,7 +15,7 @@ ssh pc$i << EOF
 sudo su
 echo "Iteration: "$i"This is host "`hostname`
 cp /etc/netplan/eth0.yaml /etc/netplan/eth0.yaml.copy
-sed -i 's/${gateway_new}\}/${gateway_new}/g' /etc/netplan/eth0.yaml
+sed -i 's/${gateway_origin}/${gateway_new}/g' /etc/netplan/eth0.yaml
 cat /etc/netplan/eth0.yaml
 #applying the config
 nohup netplan apply > /dev/null 2>&1  &
