@@ -14,13 +14,20 @@ ip_new=()
 for i in $(seq 0 1 $cnt)
 do
 	# Get original IP
-	ip=$(ssh pc$i '$(hostname -i | cut -d. -f4)')
+	ip=`host pc$i | grep address | awk '{print $4}' | cut -d. -f4`
 	ip_origin+=($ip)
 	# Get new IP
 	ip_new+=($ip_new_start)
 	ip_new_start=$((ip_new_start+1))
 done
+for i in $(seq 0 1 $cnt)
+do
+	echo "pc"$i" "${ip_origin[$i]}" "${ip_new[$i]}
+	host pc$i
+done
 
+
+exit 1
 
 # From last node to head node
 for i in $(seq $cnt -1 0)
