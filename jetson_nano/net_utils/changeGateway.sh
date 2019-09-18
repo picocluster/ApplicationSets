@@ -11,14 +11,15 @@ gateway_new=10.0.1
 for i in $(seq $cnt -1 0)
 do
 
-ssh pc$i << EOF
+sshpass -p picocluster ssh -oStrictHostKeyChecking=no picocluster@pc$i << EOF
 sudo su
 echo "Iteration: "$i"This is host "`hostname`
 cp /etc/network/interfaces /etc/network/interfaces.copy
 sed -i 's/${gateway_origin}/${gateway_new}/g' /etc/network/interfaces
 cat /etc/network/interfaces
 #applying the config
-nohup ifdown eth0 && ip addr flush eth0 && ifup eth0 > /dev/null 2>&1  &
+echo "finished"
+init 6
 EOF
 done
 

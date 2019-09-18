@@ -8,6 +8,8 @@
     - name: Update cache to make sure everything is fresh
       apt:
         update_cache: yes
+    - name: Installing curl
+      apt: name=curl state=present
 
     - name: Check to see if Docker is already installed
       shell: dpkg-query -W 'docker-ce'
