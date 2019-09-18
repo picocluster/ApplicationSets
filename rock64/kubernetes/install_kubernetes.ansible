@@ -8,6 +8,8 @@
     - name: Update cache to make sure everything is fresh
       apt:
         update_cache: yes
+    - name: Installing curl
+      apt: name=curl state=present
 
     - name: Check to see if Docker is already installed
       shell: dpkg-query -W 'docker-ce'
@@ -39,7 +41,7 @@
         - name: Install Docker
           apt: name={{ item }} state=present
           with_items:
-            - docker-ce=18.06.3~ce~3-0~ubuntu
+            - docker-ce=5:18.09.3~3-0~ubuntu-bionic
             - containerd.io
 
         - name: Append picocluster to docker Group
@@ -73,10 +75,9 @@
         - name: Install Kubernetes
           apt: name={{ item }} state=present
           with_items:
-            - kubeadm=1.11.0-00
-            - kubectl=1.11.3-00
-            - kubelet=1.11.3-00
-            - kubernetes-cni=0.6.0-00
+            - kubeadm=1.14.0-00
+            - kubectl=1.14.0-00
+            - kubelet=1.14.0-00
           register: kubernetes_install
 
         # Execute the post install requirements
@@ -134,28 +135,11 @@
 
             - shell: "sudo chown $(id -u):$(id -g) $HOME/.kube/config"
 
+            - name: Pass IPv4 traffic iptables' chain
+              shell: "sudo sysctl net.bridge.bridge-nf-call-iptables=1"
+
             - name: Set up flannel networking
-              shell: "curl -sSL https://rawgit.com/coreos/flannel/v0.11.0/Documentation/kube-flannel.yml | sed 's/amd64/arm64/g' | kubectl create -f -"
-            - name: Check to see if flannel network is defined
-              stat:
-                path: /etc/cni/net.d/10-flannel.conf
-              register: stat_result
- 
-            - name: Create the flannel network if missing
-              blockinfile:
-                dest: /etc/cni/net.d/10-flannel.conf
-                block: |
-                       {
-                         "name": "cbr0",
-                         "type": "flannel", 
-                         "delegate": {
-                           "isDefaultGateway": true
-                         }
-                       }
-                create: yes
-              become: yes
-              ignore_errors: True
-              when: stat_result.stat.exists == False
+              shell: "kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/62e44c867a2846fefb68bd5f178daf4da3095ccb/Documentation/kube-flannel.yml"
           become: no
           when: "'master' in group_names"
 
