@@ -27,6 +27,15 @@
         state: absent
       register: swap
 
+    - block:
+        - name: Add cgroups to cmdline.txt
+          lineinfile:
+            dest: /boot/cmdline.txt
+            regexp: '(^dwc_otg.lpm_enable=0)(.*)'
+            line: '\1 cgroup_enable=memory cgroup_enable=cpuset\2'
+            backrefs: yes
+          when: swap.changed
+
     # Remove nodes for swap changes to take effect
     - block:
         - name: Reboot the worker nodes if swap was removed.
@@ -57,7 +66,7 @@
             dest: /etc/docker/daemon.json
             block: |
                    {
-                     "exec-opts": ["native.cgroupdriver=systemd"],
+                     "exec-opts": ["native.cgroupdriver=cgroupfs"],
                      "log-driver": "json-file",
                      "log-opts": {
                        "max-size": "100m"
@@ -67,9 +76,6 @@
             create: yes
             marker: ""
           ignore_errors: True
-
-        - name: Make docker.service.d directory
-          shell: "mkdir -p /etc/systemd/system/docker.service.d"
 
         - name: restart docker
           systemd:
@@ -117,6 +123,26 @@
           shell: "apt-mark hold kubelet kubeadm kubectl"
           register: kubernetes_install
 
+        # Execute the post install requirements
+        - block:
+            # The API-server would not come up in time and caused kubeadm to fail. Running below processes will change the cpu resources and the time it has to start, before it will be killed
+            - name: Define CPU resources
+              shell: "(until grep 'cpu: 1' /etc/kubernetes/manifests/kube-apiserver.yaml 2> /dev/null; do sed 's/cpu: 250m/cpu: 1/' -i /etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null; sleep 0.1s; done) &"
+
+            - name: Define startup delay
+              shell: "(until grep 'initialDelaySeconds: 90' /etc/kubernetes/manifests/kube-apiserver.yaml 2> /dev/null; do sed 's/initialDelaySeconds: 15/initialDelaySeconds: 90/' -i /etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null; sleep 0.1s; done) &"
+
+            - name: Define startup file 97-k8snet.conf
+              lineinfile:
+                dest: /etc/sysctl.d/97-k8snet.conf
+                line: net.ipv4.ip_forward = 1
+                create: yes
+
+            - name: Add netfilter to modules
+              lineinfile:
+                dest: /etc/modules
+                line: br_netfilter
+                create: yes
       
       when: is_kubernetes is failed
 
