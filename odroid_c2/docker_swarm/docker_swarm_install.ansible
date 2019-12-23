@@ -15,7 +15,6 @@
         - name: Make sure certificates are installed and updated
           apt: name={{ item }} state=present
           with_items:
-            - apt-transport-https
             - ca-certificates
 
         - name: Install Docker
@@ -31,7 +30,7 @@
         - name: Reboot machine if this user was added to the docker group.
           shell: "reboot now"
           when: group.changed
-      when: is_docker | failed
+      when: is_docker is failed
 
     - name: Check to see if Docker is installed
       command: "docker"
@@ -71,7 +70,7 @@
               when: "'worker' in group_names"
           when: join_command is defined
 
-      when: (docker_response is defined) and (docker_response | success)
+      when: (docker_response is defined) and (docker_response is success)
 
     # Wait a few seconds, then print the output of the swarm status. All nodes should have joined.
     - block:
