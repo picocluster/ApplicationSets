@@ -1,0 +1,83 @@
+---
+- hosts: cluster
+  become: yes
+
+  tasks:
+    - name: "Install packages"
+      apt:
+        state: present
+        update_cache: yes
+        pkg:
+          - libncurses5-dev
+      register: packages
+
+    - name: "Download public sources"
+      uri:
+        url: https://developer.download.nvidia.com/embedded/L4T/r32-2_Release_v1.0/Nano-TX1/public_sources.tbz2
+        dest: ~root/Jetson-Nano-public_sources.tbz2
+        status-code: 200
+
+    - name: "Extract kernel source archive"
+      shell: cd ~root && tar xf ~root/Jetson-Nano-public_sources.tbz2 public_sources/kernel_src.tbz2
+      args:
+        warn: false
+
+    - name: "Remove download"
+      file:
+        name: ~root/Jetson-Nano-public_sources.tbz2
+        state: absent
+
+    - name: "Move kernel source archive"
+      shell: mv ~root/public_sources/kernel_src.tbz2 ~root/
+
+    - name: "Remove other sources"
+      file:
+        name: ~root/public_sources
+        state: absent
+
+    - name: "Unarchive kernel source"
+      shell: cd ~root && tar xf ~root/kernel_src.tbz2
+      args:
+        warn: false
+
+    - name: "Remove kernel source archive"
+      file:
+        name: ~root/kernel_src.tbz2
+        state: absent
+
+    - name: "Insert custom kernel configuration"
+      copy:
+        src: .config
+        dest: ~root/kernel/kernel-4.9/.config
+        mode: "0644"
+
+    - name: "Inject firmware to allow to boot from USB drive"
+      shell: cp /lib/firmware/tegra21x_xusb_firmware ~root/kernel/kernel-4.9/firmware/tegra21x_xusb_firmware
+
+    - name: "Build kernel and modules"
+      shell: cd ~root/kernel/kernel-4.9 && make prepare && make modules_prepare && make -j5 Image && make -j5 modules
+
+    - name: "Install kernel and modules"
+      shell: cd ~root/kernel/kernel-4.9 && make modules_install && cp -f arch/arm64/boot/Image /boot/Image
+      register: install
+
+    - name: "Remove kernel source"
+      file:
+        name: "{{ item }}"
+        state: absent
+      with_items:
+        - ~root/kernel
+        - ~root/hardware
+
+    # Reboot nodes for kernel changes to take effect
+    - block:
+        - name: Reboot the worker nodes if swap was removed.
+          shell: "reboot"
+          ignore_errors: True
+          when: "'worker' in group_names"
+
+        - name: Reboot the master node if swap was removed.
+          shell: "reboot"
+          ignore_errors: True
+          when: "'master' in group_names"
+
