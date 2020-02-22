@@ -102,6 +102,7 @@
               synchronize:
                 src: "{{ join_command_location }}"
                 dest: "{{ join_command_location }}"
+              when: "'worker' in group_names"
           when: "'master' in group_names"
 
         # Some additional setup for the control user on master
