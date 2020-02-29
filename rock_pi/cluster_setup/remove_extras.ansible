@@ -1,0 +1,44 @@
+---
+- hosts: localhost 
+  gather_facts: no
+  become: yes
+
+  tasks:
+    - name: Remove extra packages and applications
+      apt: name={{ item }} state=absent purge=yes
+      with_items:
+        - pulseaudio
+        - rhythmbox
+        - shotwell
+        - smplayer
+        - speech-dispatcher
+        - thunderbird
+        - chromium-browser
+        - scratch
+        - brasero
+        - sonic-pi
+        - libreoffice-*
+        - fonts-noto-cjk
+        - minecraft
+        - vlc
+        - qpdfview
+        - geany
+        - idle
+        - idle3
+
+    - name: Remove unneeded packages
+      shell: sudo apt-get autoremove -y
+
+    - name: Clean up the repository
+      shell: sudo apt-get clean -y
+
+    - name: Update the apt cache
+      apt: 
+        update_cache: yes
+
+    - name: Remove log files
+      shell: rm -rf /var/logs/*
+
+    - name: Remove cache files
+      shell: rm -rf /var/cache/*
+

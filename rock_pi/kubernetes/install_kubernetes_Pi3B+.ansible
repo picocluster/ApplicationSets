@@ -1,0 +1,218 @@
+---
+- hosts: cluster
+  become: yes
+  vars:
+      join_command_location: "./join_command.out"
+
+  tasks:
+    - name: Set iptables to legacy
+      shell: "update-alternatives --set iptables /usr/sbin/iptables-legacy"
+
+    - name: Set iptables6 to legacy
+      shell: "update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy"
+
+    - name: Update cache to make sure everything is fresh
+      apt:
+        update_cache: yes
+
+    - name: turn off the swap file
+      systemd:
+        name: dphys-swapfile
+        enabled: no
+        masked: yes
+
+    - name: Remove swapfile package
+      apt:
+        name: ['dphys-swapfile']
+        state: absent
+      register: swap
+
+    - block:
+        - name: Add cgroups to cmdline.txt
+          lineinfile:
+            dest: /boot/cmdline.txt
+            regexp: '(^dwc_otg.lpm_enable=0)(.*)'
+            line: '\1 cgroup_enable=memory cgroup_enable=cpuset\2'
+            backrefs: yes
+          when: swap.changed
+
+    # Remove nodes for swap changes to take effect
+    - block:
+        - name: Reboot the worker nodes if swap was removed.
+          shell: "reboot"
+          ignore_errors: True
+          when: "'worker' in group_names"
+
+        - name: Reboot the master node if swap was removed.
+          shell: "reboot"
+          ignore_errors: True
+          when: "'master' in group_names"
+      when: swap.changed
+
+    - name: Check to see if Docker is already installed
+      shell: dpkg-query -W 'docker'
+      ignore_errors: True
+      register: is_docker
+
+    # Docker install. Skip if already installed
+    - block:
+        - name: install latest docker.io
+          apt:
+            name: ['docker.io']
+            state: present
+
+        - name: Create docker daemon file
+          blockinfile:
+            dest: /etc/docker/daemon.json
+            block: |
+                   {
+                     "exec-opts": ["native.cgroupdriver=cgroupfs"],
+                     "log-driver": "json-file",
+                     "log-opts": {
+                       "max-size": "100m"
+                     },
+                     "storage-driver": "overlay2"
+                   }
+            create: yes
+            marker: ""
+          ignore_errors: True
+
+        - name: restart docker
+          systemd:
+            state: restarted
+            daemon_reload: yes
+            name: docker
+
+        - name: hold docker.io so it's not upgraded
+          shell: "apt-mark hold docker.io"
+
+        - name: Append picocluster to docker Group
+          user:
+            name: picocluster
+            groups: docker
+            append: yes
+          register: group
+      when: is_docker is failed
+
+    - name: Check to see if Kubernetes is already installed
+      shell: dpkg-query -W 'kubeadm'
+      ignore_errors: True
+      register: is_kubernetes
+
+    # Kubernetes install. Skip if already installed
+    - block:
+        - name: Install Kubernetes repository key
+          shell: "curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -"
+
+        - name: Add Kubernetes source for apt
+          lineinfile:
+            dest: /etc/apt/sources.list.d/kubernetes.list
+            line: "deb http://apt.kubernetes.io/ kubernetes-xenial main"
+            create: yes
+
+        - name: Update cache to get kubernetes
+          apt:
+            update_cache: yes
+
+        - name: Install Kubernetes
+          apt:
+            name: ['kubeadm=1.15.5-00', 'kubectl=1.15.5-00', 'kubelet=1.15.5-00', 'kubernetes-cni=0.7.5-00']
+            state: present
+
+        - name: hold kubelet kubeadm kubectl so they are not upgraded
+          shell: "apt-mark hold kubelet kubeadm kubectl"
+          register: kubernetes_install
+
+        # Execute the post install requirements
+        - block:
+            # The API-server would not come up in time and caused kubeadm to fail. Running below processes will change the cpu resources and the time it has to start, before it will be killed
+            - name: Define CPU resources
+              shell: "(until grep 'cpu: 1' /etc/kubernetes/manifests/kube-apiserver.yaml 2> /dev/null; do sed 's/cpu: 250m/cpu: 1/' -i /etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null; sleep 0.1s; done) &"
+
+            - name: Define startup delay
+              shell: "(until grep 'initialDelaySeconds: 90' /etc/kubernetes/manifests/kube-apiserver.yaml 2> /dev/null; do sed 's/initialDelaySeconds: 15/initialDelaySeconds: 90/' -i /etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null; sleep 0.1s; done) &"
+
+            - name: Define startup file 97-k8snet.conf
+              lineinfile:
+                dest: /etc/sysctl.d/97-k8snet.conf
+                line: net.ipv4.ip_forward = 1
+                create: yes
+
+            - name: Add netfilter to modules
+              lineinfile:
+                dest: /etc/modules
+                line: br_netfilter
+                create: yes
+      
+      when: is_kubernetes is failed
+
+    - block:
+        # Create Kubernetes cluster and save join command to file
+        - block:
+            - name: Init kubernetes
+              command: "kubeadm init --pod-network-cidr 10.244.0.0/16"
+              register: kube_init
+
+            - name: Extract join command
+              command: "kubeadm token create --print-join-command"
+              register: join_command
+
+            - name: Save join command
+              local_action: copy content={{ join_command.stdout_lines | last  | trim }} dest="{{ join_command_location }}"
+
+            - name: Copy join command to worker nodes 
+              synchronize:
+                src: "{{ join_command_location }}"
+                dest: "{{ join_command_location }}"
+          when: "'master' in group_names"
+
+        # Some additional setup for the control user on master
+        - block:
+            - name: Remove .kube directory if it exists
+              file:
+                path: "$HOME/.kube"
+                state: absent
+
+            - name: Copy kube admin config to user
+              shell: "mkdir -p $HOME/.kube"
+
+            - shell: "sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config"
+
+            - shell: "sudo chown $(id -u):$(id -g) $HOME/.kube/config"
+
+            - name: Set up flannel networking
+              shell: "curl -sSL https://rawgit.com/coreos/flannel/v0.11.0/Documentation/kube-flannel.yml | kubectl create -f -"
+              ignore_errors: True
+
+          become: no
+          when: "'master' in group_names"
+
+        # Read the join command on the workers and join the cluster
+        - block:
+            - name: Read join command on worker nodes
+              debug: msg="{{ lookup('file', join_command_location) }}"
+              register: join_command_local
+              when: "'worker' in group_names"
+
+            - name: Join Workers to cluster
+              command: "{{ join_command_local.msg }}"
+              when: "'worker' in group_names"
+          when: (kube_init is success) and (join_command is defined)
+      
+      when: (is_kubernetes is success) or (kubernetes_install is success)
+
+
+    # Wait a few seconds, then print the output of the Kubernetes cluster status. All nodes should have joined.
+    - block:
+        - name: Wait 60 seconds for Kubernetes to stabilize
+          wait_for: 
+            timeout: 60
+
+        - name: Retrieve the  cluster status and show it
+          shell: kubectl get nodes
+          register: kubernetes_status
+          become: no
+
+        - debug: var=kubernetes_status.stdout_lines
+      when: "'master' in group_names"
+

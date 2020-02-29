@@ -1,0 +1,17 @@
+---
+- hosts: localhost
+  become: yes
+
+  tasks:
+    # Remove the linaro user
+    - name: Remove the user rock64
+      user:
+        name: linaro
+        state: absent
+        remove: yes
+
+    - name: Remove linaro group
+      group:
+        name: linaro
+        state: absent
+
