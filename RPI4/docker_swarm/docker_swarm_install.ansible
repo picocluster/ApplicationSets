@@ -13,10 +13,9 @@
     # Skip if Docker is already installed
     - block:
         - name: Make sure certificates are installed and updated
-          apt: name={{ item }} state=present
-          with_items:
-            - apt-transport-https
-            - ca-certificates
+          apt:
+            name: ['apt-transport-https', 'ca-certificates']
+            state: present
 
         - name: Install Docker
           shell: curl -sSL https://get.docker.com/ | sh
