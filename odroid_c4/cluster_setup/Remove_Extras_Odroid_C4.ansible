@@ -7,18 +7,43 @@
     - name: Remove extra packages and applications
       apt: name={{ item }} state=absent purge=yes
       with_items:
+        - pulseaudio
         - rhythmbox
         - shotwell
+        - smplayer
+        - speech-dispatcher
+        - thunderbird
+        - chromium-browser
         - scratch
         - brasero
         - sonic-pi
         - libreoffice-*
         - fonts-noto-cjk
-        - minecraft
+        - fonts-noto-color-emoji
+        - vlc
         - qpdfview
         - geany
         - idle
         - idle3
+        - kodi*
+        - firefox
+        - engrampa
+        - plank
+        - pluma
+        - atril
+        - joe
+        - simple-scan
+        - transmission-gtk
+        - transmission-common
+        - redshift
+        - redshift-gtk
+        - cheese
+        - cheese-common
+        - fonts-noto-hinted
+        - ubuntu-mate-guide
+        - mate-user-guide
+        - ubuntu-mate-wallpapers-photos
+        - ubuntu-mate-wallpapers-bionic
 
     - name: Remove unneeded packages
       shell: sudo apt-get autoremove -y
