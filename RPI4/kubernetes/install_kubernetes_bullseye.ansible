@@ -5,12 +5,6 @@
       join_command_location: "./join_command.out"
 
   tasks:
-    - name: Set iptables to legacy
-      shell: "update-alternatives --set iptables /usr/sbin/iptables-legacy"
-
-    - name: Set iptables6 to legacy
-      shell: "update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy"
-
     - name: Update cache to make sure everything is fresh
       apt:
         update_cache: yes
@@ -31,12 +25,12 @@
         - name: Add cgroups to cmdline.txt
           lineinfile:
             dest: /boot/cmdline.txt
-            regexp: '(^dwc_otg.lpm_enable=0)(.*)'
+            regexp: '(^console=serial0,115200 console=tty1)(.*)'
             line: '\1 cgroup_enable=memory cgroup_enable=cpuset\2'
             backrefs: yes
           when: swap.changed
 
-    # Remove nodes for swap changes to take effect
+    # Reboot nodes for swap changes to take effect
     - block:
         - name: Reboot the worker nodes if swap was removed.
           shell: "reboot"
@@ -66,7 +60,7 @@
             dest: /etc/docker/daemon.json
             block: |
                    {
-                     "exec-opts": ["native.cgroupdriver=cgroupfs"],
+                     "exec-opts": ["native.cgroupdriver=systemd"],
                      "log-driver": "json-file",
                      "log-opts": {
                        "max-size": "100m"
@@ -76,6 +70,9 @@
             create: yes
             marker: ""
           ignore_errors: True
+
+        - name: Make docker.service.d directory
+          shell: "mkdir -p /etc/systemd/system/docker.service.d"
 
         - name: restart docker
           systemd:
@@ -116,33 +113,13 @@
 
         - name: Install Kubernetes
           apt:
-            name: ['kubeadm=1.15.5-00', 'kubectl=1.15.5-00', 'kubelet=1.15.5-00', 'kubernetes-cni=0.7.5-00']
+            name: ['kubeadm=1.22.4-00', 'kubectl=1.22.4-00', 'kubelet=1.22.4-00', 'kubernetes-cni']
             state: present
 
         - name: hold kubelet kubeadm kubectl so they are not upgraded
           shell: "apt-mark hold kubelet kubeadm kubectl"
           register: kubernetes_install
 
-        # Execute the post install requirements
-        - block:
-            # The API-server would not come up in time and caused kubeadm to fail. Running below processes will change the cpu resources and the time it has to start, before it will be killed
-            - name: Define CPU resources
-              shell: "(until grep 'cpu: 1' /etc/kubernetes/manifests/kube-apiserver.yaml 2> /dev/null; do sed 's/cpu: 250m/cpu: 1/' -i /etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null; sleep 0.1s; done) &"
-
-            - name: Define startup delay
-              shell: "(until grep 'initialDelaySeconds: 90' /etc/kubernetes/manifests/kube-apiserver.yaml 2> /dev/null; do sed 's/initialDelaySeconds: 15/initialDelaySeconds: 90/' -i /etc/kubernetes/manifests/kube-apiserver.yaml 2>/dev/null; sleep 0.1s; done) &"
-
-            - name: Define startup file 97-k8snet.conf
-              lineinfile:
-                dest: /etc/sysctl.d/97-k8snet.conf
-                line: net.ipv4.ip_forward = 1
-                create: yes
-
-            - name: Add netfilter to modules
-              lineinfile:
-                dest: /etc/modules
-                line: br_netfilter
-                create: yes
       
       when: is_kubernetes is failed
 
@@ -181,7 +158,7 @@
             - shell: "sudo chown $(id -u):$(id -g) $HOME/.kube/config"
 
             - name: Set up flannel networking
-              shell: "curl -sSL https://rawgit.com/coreos/flannel/v0.11.0/Documentation/kube-flannel.yml | kubectl create -f -"
+              shell: "curl -sSL https://rawgit.com/coreos/flannel/v0.15.1/Documentation/kube-flannel.yml | kubectl create -f -"
               ignore_errors: True
 
           become: no
