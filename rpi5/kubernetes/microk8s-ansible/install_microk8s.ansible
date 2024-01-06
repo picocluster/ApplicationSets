@@ -1,0 +1,96 @@
+---
+- hosts: cluster
+  become: no
+  vars:
+      join_command_location: "./join_command.out"
+      addons:
+        - kubectl
+        - helm3
+
+  tasks:
+    - name: Update cache to make sure everything is fresh
+      apt:
+        update_cache: yes
+      become: yes
+
+    - name: Add cgroups to cmdline.txt
+      lineinfile:
+        dest: /boot/firmware/cmdline.txt
+        regexp: '(^console=serial0,115200 console=tty1)(.*)'
+        line: '\1 cgroup_enable=memory cgroup_memory=1\2'
+        backrefs: yes
+      become: yes
+
+    # MicroK8S Install. Skip if already installed.
+    - block:
+        - name: Install MicroK8s
+          become: yes
+          snap:
+            name: microk8s
+            channel: "1.22/stable"
+            classic: yes
+
+        - name: Add picocluster user to group microk8s
+          become: yes
+          user:
+            name: picocluster
+            groups: microk8s
+            append: yes
+
+        - name: Change file ownership, group and permissions
+          ansible.builtin.file:
+            path: ~/.kube
+            owner: picocluster 
+            group: picocluster
+            recurse: yes
+
+        - name: Enable Microk8s addons
+          become: yes
+          loop: "{{ addons }}"
+          loop_control:
+            label: "{{ item.name }}"
+          command: microk8s.enable {{ item }}
+          register: wp
+          failed_when: "wp.rc not in [ 0, 1 ]"
+
+        - name: Add bash completion
+          shell: echo "source <(microk8s.kubectl completion bash)" >> ~/.bashrc
+          shell: echo "source <(microk8s.helm3 completion bash)" >> ~/.bashrc
+          register: kubernetes_install 
+          failed_when: "kubernetes_install.rc not in [ 0, 1 ]"
+
+        - name: Create kubectl alias
+          become: yes
+          command: "snap alias microk8s.kubectl kubectl"
+          changed_when: false
+
+        - name: Create helm3 alias
+          become: yes
+          command: "snap alias microk8s.helm3 helm"
+          changed_when: false
+
+    - block:
+        # Create Kubernetes cluster and save join command to file
+        - block:
+            - name: deploy files with network address in them
+              include_tasks: send_join_to_workers.yml 
+              loop: "{{ groups['worker'] }}"
+              register: join_command
+          when: "'master' in group_names"
+
+      when: (kubernetes_install is success)
+
+
+    # Wait a few seconds, then print the output of the Kubernetes cluster status. All nodes should have joined.
+    - block:
+        - name: Wait 60 seconds for MicroK8S to stabilize
+          wait_for: 
+            timeout: 60
+
+        - name: Retrieve the  cluster status and show it
+          shell: microk8s.kubectl get nodes
+          register: kubernetes_status
+
+        - debug: var=kubernetes_status.stdout_lines
+      when: "'master' in group_names"
+

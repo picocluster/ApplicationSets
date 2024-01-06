@@ -1,0 +1,1 @@
+  openjdk11-temurin @11.0.15_0 (active) requested_variants='' platform='darwin 21' archs='x86_64' date='2022-05-09T21:55:28-0600'

@@ -1,0 +1,29 @@
+---
+- hosts: cluster
+  gather_facts: no
+  become: yes
+
+  tasks:
+    - block:
+        - name: Remove .kube directory if it exists
+          file:
+            path: "$HOME/.kube"
+            state: absent
+      when: "'master' in group_names"
+
+    - name: Reset the kubernetes install to remove node from cluster
+      command: 'kubeadm reset --force'
+      ignore_errors: True
+
+    - name: hold docker.io so it's not upgraded
+      shell: "apt-mark unhold docker.io kubectl kubeadm kubelet kubernetes-cni"
+
+    - name: Remove packages
+      apt: name={{ item }} state=absent purge=yes
+      with_items:
+        - docker.io
+        - kubeadm
+        - kubectl
+        - kubelet
+        - kubernetes-cni
+

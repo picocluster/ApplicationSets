@@ -1,20 +1,39 @@
 ---
-- hosts: cluster
+- hosts: cluster 
   become: yes
   vars:
       join_command_location: "./join_command.out"
 
-  tasks:    
+  tasks:
+    - name: Flush iptables before changing to iptables-legacy
+      iptables:
+        flush: true
+
+    - name: Set iptables to legacy
+      alternatives:
+        path: /usr/sbin/iptables-legacy
+        name: iptables
+        register: iptables
+
+    - name: Set iptables6 to legacy
+      alternatives:
+        path: /usr/sbin/ip6tables-legacy
+        name: ip6tables
+
     - name: Update cache to make sure everything is fresh
       apt:
         update_cache: yes
 
     - name: turn off the swap file
-      apt: name={{ item }} state=absent purge=yes
-      with_items:
-        - zramswap-enabler
-        - zram-config
-      register: swap
+      shell: "swapoff -a"
+
+    - block:
+        - name: Add cgroups to grub
+          lineinfile:
+            dest: /etc/default/grub
+            regexp: '(^GRUB_CMDLINE_LINUX_DEFAULT="quiet splash)(.*)'
+            line: '\1 systemd.unified_cgroup_hierarchy=0 \2'
+            backrefs: yes
 
     # Reboot nodes for swap changes to take effect
     - block:
@@ -27,10 +46,10 @@
           shell: "reboot"
           ignore_errors: True
           when: "'master' in group_names"
-      when: swap.changed
+      when: iptables.skipped
 
     - name: Check to see if Docker is already installed
-      shell: dpkg-query -W 'docker'
+      shell: dpkg-query -W 'docker.io'
       ignore_errors: True
       register: is_docker
 
@@ -71,7 +90,7 @@
 
         - name: Append picocluster to docker Group
           user:
-            name: picocluster
+            name: cbrown 
             groups: docker
             append: yes
           register: group
@@ -99,13 +118,14 @@
 
         - name: Install Kubernetes
           apt:
-            name: ['kubeadm=1.22.4-00', 'kubectl=1.22.4-00', 'kubelet=1.22.4-00', 'kubernetes-cni']
+            name: ['kubeadm=1.24.1-00', 'kubectl=1.24.1-00', 'kubelet=1.24.1-00', 'kubernetes-cni']
             state: present
 
         - name: hold kubelet kubeadm kubectl so they are not upgraded
           shell: "apt-mark hold kubelet kubeadm kubectl"
           register: kubernetes_install
 
+      
       when: is_kubernetes is failed
 
     - block:
@@ -128,7 +148,6 @@
                 dest: "{{ join_command_location }}"
           when: "'master' in group_names"
 
-
         # Some additional setup for the control user on master
         - block:
             - name: Remove .kube directory if it exists
@@ -144,7 +163,7 @@
             - shell: "sudo chown $(id -u):$(id -g) $HOME/.kube/config"
 
             - name: Set up flannel networking
-              shell: "curl -sSL https://rawgit.com/coreos/flannel/v0.15.1/Documentation/kube-flannel.yml | sed 's/amd64/arm64/g' | kubectl create -f -"
+              shell: "curl -sSL https://rawgit.com/coreos/flannel/v0.15.1/Documentation/kube-flannel.yml | kubectl create -f -"
               ignore_errors: True
 
           become: no

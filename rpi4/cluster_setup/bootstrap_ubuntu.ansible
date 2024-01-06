@@ -4,13 +4,6 @@
   become: yes
 
   tasks:
-    - name: install needed network manager libs
-      package:
-        name:
-          - network-manager
-          - python3-dbus
-        state: present
-
     # Add picocluster group and user and add sudo access
     - name: Add picocluster group
       group:
@@ -26,10 +19,10 @@
         home: /home/picocluster
         shell: /bin/bash
 
-    - name: Append picocluster to odroid groups
+    - name: Append picocluster to groups
       user:
         name: picocluster
-        groups: adm,tty,disk,lp,dialout,voice,sudo,audio,backup,video,plugdev,users,input,crontab
+        groups: adm,dialout,cdrom,sudo,audio,dip,video,plugdev,netdev
         append: yes
 
     - name: Add sudo for picocluster
@@ -59,33 +52,25 @@
     - name: Change hostname to pc0
       lineinfile:
         dest: /etc/hostname
-        regexp: '^odroid'
+        regexp: '^ubuntu'
         line: 'pc0'
         state: present
 
-    # Remove DHCP line
-    - name: Change hostname to pc0
-      lineinfile:
-        dest: /etc/network/interfaces.d/eth0
-        regexp: '^     dhcp4: true'
-        state: absent
-
-    # This doesn't quite work. Interface still left on DHCP.
-    - name: Add static network connection
-      nmcli:
-        conn_name: eth0
-        ifname: eth0
-        type: ethernet
-        ip4: 10.1.10.240/24
-        gw4: 10.1.10.1
-        dns4:
-        - 10.1.10.1
-        - 8.8.8.8
-        state: present
+    - name: Add static network settings
+      blockinfile:
+        dest: /etc/netplan/10-rpi-ethernet-eth0.yaml
+        insertafter: '^     dhcp4: true'
+        block: |
+                dhcp4: false
+                dhcp6: false
+                addresses: [10.1.10.240/24]
+                gateway4: 10.1.10.1
+                nameservers:
+                  addresses: [8.8.8.8,10.1.10.1]
 
     - name: Add host mappings to /etc/hosts
       blockinfile:
-        path: /etc/hosts
+        dest: /etc/hosts
         block: |
           {{ item.ip }} {{ item.name }}
         marker: "# {mark} ANSIBLE MANAGED BLOCK {{ item.name }}"
@@ -96,11 +81,25 @@
       - { name: pc3, ip: 10.1.10.243 }
       - { name: pc4, ip: 10.1.10.244 }
 
+    - name: Make sure ansible directory exists
+      file:
+        path: /etc/ansible
+        state: directory
+
     - name: Add our ansible hosts setup
-      blockinfile:
+      copy:
         dest: /etc/ansible/hosts
-        marker: "# {mark} ANSIBLE MANAGED BLOCK HOSTS"
-        block: |
+        content: |
+          # This is the default ansible 'hosts' file.
+          #
+          # It should live in /etc/ansible/hosts
+          #
+          #   - Comments begin with the '#' character
+          #   - Blank lines are ignored
+          #   - Groups of hosts are delimited by [header] elements
+          #   - You can enter hostnames or ip addresses
+          #   - A hostname/ip can be a member of multiple groups
+
           # Ungrouped
           pc[0:4]
 

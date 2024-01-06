@@ -4,70 +4,39 @@
   vars:
       join_command_location: "./join_command.out"
 
-  tasks:    
-    - name: Update cache to make sure everything is fresh
-      apt:
-        update_cache: yes
-
-    - name: turn off the swap file
-      apt: name={{ item }} state=absent purge=yes
-      with_items:
-        - zramswap-enabler
-        - zram-config
-      register: swap
-
-    # Reboot nodes for swap changes to take effect
-    - block:
-        - name: Reboot the worker nodes if swap was removed.
-          shell: "reboot"
-          ignore_errors: True
-          when: "'worker' in group_names"
-
-        - name: Reboot the master node if swap was removed.
-          shell: "reboot"
-          ignore_errors: True
-          when: "'master' in group_names"
-      when: swap.changed
-
+  tasks:
     - name: Check to see if Docker is already installed
-      shell: dpkg-query -W 'docker'
+      shell: dpkg-query -W 'docker-ce'
       ignore_errors: True
       register: is_docker
 
     # Docker install. Skip if already installed
     - block:
-        - name: install latest docker.io
-          apt:
-            name: ['docker.io']
-            state: present
+        - name: Make sure certificates are installed and updated
+          apt: name={{ item }} state=present
+          with_items:
+            - apt-transport-https
+            - ca-certificates
+            - software-properties-common
 
-        - name: Create docker daemon file
-          blockinfile:
-            dest: /etc/docker/daemon.json
-            block: |
-                   {
-                     "exec-opts": ["native.cgroupdriver=systemd"],
-                     "log-driver": "json-file",
-                     "log-opts": {
-                       "max-size": "100m"
-                     },
-                     "storage-driver": "overlay2"
-                   }
+        - name: Install Docker repository key
+          shell: "curl -fsSL https://download.docker.com/linux/raspbian/gpg | apt-key add -"
+
+        - name: Add Docker source for apt
+          lineinfile:
+            dest: /etc/apt/sources.list.d/docker.list
+            line: "deb [arch=armhf] https://download.docker.com/linux/raspbian stretch stable"
             create: yes
-            marker: ""
-          ignore_errors: True
 
-        - name: Make docker.service.d directory
-          shell: "mkdir -p /etc/systemd/system/docker.service.d"
+        - name: Update cache to get Docker
+          apt:
+            update_cache: yes
 
-        - name: restart docker
-          systemd:
-            state: restarted
-            daemon_reload: yes
-            name: docker
-
-        - name: hold docker.io so it's not upgraded
-          shell: "apt-mark hold docker.io"
+        - name: Install Docker
+          apt: name={{ item }} state=present
+          with_items:
+            - docker-ce=18.06.3~ce~3-0~ubuntu
+            - containerd.io
 
         - name: Append picocluster to docker Group
           user:
@@ -98,13 +67,30 @@
             update_cache: yes
 
         - name: Install Kubernetes
-          apt:
-            name: ['kubeadm=1.22.4-00', 'kubectl=1.22.4-00', 'kubelet=1.22.4-00', 'kubernetes-cni']
-            state: present
-
-        - name: hold kubelet kubeadm kubectl so they are not upgraded
-          shell: "apt-mark hold kubelet kubeadm kubectl"
+          apt: name={{ item }} state=present
+          with_items:
+            - kubeadm=1.11.0-00
+            - kubectl=1.11.3-00
+            - kubelet=1.11.3-00
+            - kubernetes-cni=0.6.0-00
           register: kubernetes_install
+
+        # Execute the post install requirements
+        - block:
+            # [POST INSTALL ITEMS]
+            - name: turn off the swap file
+              apt: name={{ item }} state=absent purge=yes
+              with_items:
+                - zram-config
+              register: swapfile
+
+            - name: Wait 10 seconds for disk writes to stabilize
+              wait_for: 
+                timeout: 10
+
+            - name: Reboot machine if swapfile status changed
+              shell: "reboot"
+              when: swapfile.changed
 
       when: is_kubernetes is failed
 
@@ -144,11 +130,31 @@
             - shell: "sudo chown $(id -u):$(id -g) $HOME/.kube/config"
 
             - name: Set up flannel networking
-              shell: "curl -sSL https://rawgit.com/coreos/flannel/v0.15.1/Documentation/kube-flannel.yml | sed 's/amd64/arm64/g' | kubectl create -f -"
-              ignore_errors: True
+              shell: "curl -sSL https://rawgit.com/coreos/flannel/v0.11.0/Documentation/kube-flannel.yml | sed 's/amd64/arm64/g' | kubectl create -f -"
 
+            - name: Check to see if flannel network is defined
+              stat:
+                path: /etc/netplan/eth0.yaml
+              register: stat_result
+ 
+            - name: Create the flannel network if missing
+              blockinfile:
+                dest: /etc/netplan/eth0.yaml
+                regexp: '^     dhcp4: true'
+                block: |
+                       {
+                         "name": "cbr0",
+                         "type": "flannel", 
+                         "delegate": {
+                           "isDefaultGateway": true
+                         }
+                       }
+                become: yes
+                create: yes
+              when: stat_result.stat.exists is False
           become: no
           when: "'master' in group_names"
+
 
         # Read the join command on the workers and join the cluster
         - block:
@@ -169,7 +175,7 @@
     - block:
         - name: Wait 60 seconds for Kubernetes to stabilize
           wait_for: 
-            timeout: 60
+            timeout: 10
 
         - name: Retrieve the  cluster status and show it
           shell: kubectl get nodes

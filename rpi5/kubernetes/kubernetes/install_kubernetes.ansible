@@ -4,17 +4,52 @@
   vars:
       join_command_location: "./join_command.out"
 
-  tasks:    
+  tasks:
+    - name: Modify cmdline to add cgroup support
+      lineinfile:
+        path: /boot/cmdline.txt
+        regexp: '^((?!.*\bcgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory\b).*)$'
+        line: '\1 cgroup_enable=cpuset cgroup_memory=1 cgroup_enable=memory'
+        backrefs: true
+
+    - name: Flush iptables before changing to iptables-legacy
+      iptables:
+        flush: true
+
+    - name: Set iptables to legacy
+      alternatives:
+        path: /usr/sbin/iptables-legacy
+        name: iptables
+
+    - name: Set iptables6 to legacy
+      alternatives:
+        path: /usr/sbin/ip6tables-legacy
+        name: ip6tables
+
     - name: Update cache to make sure everything is fresh
       apt:
         update_cache: yes
 
     - name: turn off the swap file
-      apt: name={{ item }} state=absent purge=yes
-      with_items:
-        - zramswap-enabler
-        - zram-config
+      systemd:
+        name: dphys-swapfile
+        enabled: no
+        masked: yes
+
+    - name: Remove swapfile package
+      apt:
+        name: ['dphys-swapfile']
+        state: absent
       register: swap
+
+    - block:
+        - name: Add cgroups to cmdline.txt
+          lineinfile:
+            dest: /boot/cmdline.txt
+            regexp: '(^console=serial0,115200 console=tty1)(.*)'
+            line: '\1 cgroup_enable=memory cgroup_enable=cpuset\2'
+            backrefs: yes
+          when: swap.changed
 
     # Reboot nodes for swap changes to take effect
     - block:
@@ -99,13 +134,14 @@
 
         - name: Install Kubernetes
           apt:
-            name: ['kubeadm=1.22.4-00', 'kubectl=1.22.4-00', 'kubelet=1.22.4-00', 'kubernetes-cni']
+            name: ['kubeadm=1.15.5-00', 'kubectl=1.15.5-00', 'kubelet=1.15.5-00', 'kubernetes-cni=0.7.5-00']
             state: present
 
         - name: hold kubelet kubeadm kubectl so they are not upgraded
           shell: "apt-mark hold kubelet kubeadm kubectl"
           register: kubernetes_install
 
+      
       when: is_kubernetes is failed
 
     - block:
@@ -128,7 +164,6 @@
                 dest: "{{ join_command_location }}"
           when: "'master' in group_names"
 
-
         # Some additional setup for the control user on master
         - block:
             - name: Remove .kube directory if it exists
@@ -144,7 +179,7 @@
             - shell: "sudo chown $(id -u):$(id -g) $HOME/.kube/config"
 
             - name: Set up flannel networking
-              shell: "curl -sSL https://rawgit.com/coreos/flannel/v0.15.1/Documentation/kube-flannel.yml | sed 's/amd64/arm64/g' | kubectl create -f -"
+              shell: "curl -sSL https://rawgit.com/coreos/flannel/v0.11.0/Documentation/kube-flannel.yml | kubectl create -f -"
               ignore_errors: True
 
           become: no

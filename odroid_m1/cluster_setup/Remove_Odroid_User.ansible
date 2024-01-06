@@ -3,15 +3,15 @@
   become: yes
 
   tasks:
-    # Remove the pi user
-    - name: Remove the user pi
+    # Remove the odroid user
+    - name: Remove the user odroid
       user:
-        name: pi
+        name: odroid
         state: absent
         remove: yes
 
-    - name: Remove pi group
+    - name: Remove odroid group
       group:
-        name: pi
+        name: odroid
         state: absent
 

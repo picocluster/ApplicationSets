@@ -1,0 +1,17 @@
+---
+- hosts: localhost
+  become: yes
+
+  tasks:
+    # Remove the ubuntu user
+    - name: Remove the user ubuntu
+      user:
+        name: ubuntu
+        state: absent
+        remove: yes
+
+    - name: Remove ubuntu group
+      group:
+        name: ubuntu 
+        state: absent
+
