@@ -21,7 +21,7 @@
     - name: Remove packages
       apt: name={{ item }} state=absent purge=yes
       with_items:
-        - docker.io
+        - containerd
         - kubeadm
         - kubectl
         - kubelet
