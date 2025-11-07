@@ -4,11 +4,15 @@ This directory contains Ansible playbooks for setting up Kubernetes on Odroid H4
 
 ## Overview
 
-The Odroid H4 is an Intel-based single-board computer running Ubuntu. These scripts provide three different Kubernetes setup options:
+The Odroid H4 is an Intel-based single-board computer running Ubuntu. These scripts provide four different Kubernetes setup options:
 
 1. **Stock Kubernetes with containerd (Single-node)** - For development/testing on one node
 2. **Stock Kubernetes with containerd (Cluster)** - Full multi-node cluster setup
-3. **MicroK8s** - Lightweight, simplified Kubernetes installation
+3. **K3s (Single-node)** - Lightweight Kubernetes, perfect for edge/IoT
+4. **K3s (Cluster)** - Lightweight multi-node cluster
+5. **MicroK8s** - Snap-based Kubernetes installation
+
+See [K3s README](README_k3s.md) for detailed K3s guide.
 
 ## Prerequisites
 
@@ -129,7 +133,54 @@ ansible pc0 -m shell -a "kubectl get pods --all-namespaces"
 ansible pc0 -m shell -a "kubectl cluster-info"
 ```
 
-### Option 3: MicroK8s Installation
+### Option 3: K3s Installation (Lightweight Kubernetes)
+
+Best for: Edge devices, IoT, resource-constrained environments, rapid deployment
+
+#### Single-Node K3s
+
+```bash
+# Install K3s on a single node
+ansible-playbook install_k3s_single.ansible -l pc0
+```
+
+**What this does:**
+- Installs lightweight K3s server
+- Disables swap (required)
+- Sets up kubeconfig for both root and picocluster users
+- Creates kubectl symlink
+- Ready for immediate use
+
+**Verify installation:**
+```bash
+ansible pc0 -m shell -a "k3s kubectl get nodes"
+ansible pc0 -m shell -a "k3s kubectl get pods -A"
+```
+
+#### Multi-Node K3s Cluster
+
+```bash
+# Deploy K3s cluster
+ansible-playbook install_k3s_cluster.ansible
+```
+
+**What this does:**
+- Installs K3s server on master node
+- Generates authentication token
+- Joins all worker nodes automatically
+- Verifies cluster readiness
+- Sets up kubeconfig for users
+
+**K3s Advantages:**
+- ~50MB binary (vs 100MB+ for Kubernetes)
+- 30-second single-node setup (vs 5+ minutes)
+- SQLite built-in (no external database needed)
+- Perfect for Odroid H4's limited resources
+- Still full-featured Kubernetes
+
+**For detailed K3s guide, see [K3s README](README_k3s.md)**
+
+### Option 4: MicroK8s Installation
 
 Best for: Quick setup, simplified management, single/small clusters
 
