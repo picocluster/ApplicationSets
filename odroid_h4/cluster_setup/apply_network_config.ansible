@@ -1,0 +1,107 @@
+---
+# Apply network configuration to a specific node
+# Usage: ansible-playbook apply_network_config.ansible -l pc0 -e "node_ip=10.1.10.240"
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    gateway: "10.1.10.1"
+    netmask: "255.255.255.0"
+    dns_servers: ["10.1.10.1", "8.8.8.8"]
+
+  pre_tasks:
+    - name: Validate node_ip parameter is provided
+      assert:
+        that:
+          - node_ip is defined
+          - node_ip | regex_search('^10\\.1\\.10\\.[0-9]+$')
+        fail_msg: "node_ip must be defined and in format 10.1.10.X"
+
+  tasks:
+    - name: Extract node number from inventory_hostname
+      set_fact:
+        node_number: "{{ inventory_hostname | regex_replace('pc', '') }}"
+
+    - name: Backup current network configuration
+      copy:
+        src: /etc/network/interfaces
+        dest: /etc/network/interfaces.backup.{{ ansible_date_time.iso8601_basic_short }}
+        remote_src: yes
+        mode: '0644'
+      ignore_errors: yes
+
+    - name: Create network interface configuration (netplan style for Ubuntu)
+      block:
+        - name: Create netplan configuration directory
+          file:
+            path: /etc/netplan
+            state: directory
+            mode: '0755'
+
+        - name: Configure netplan for static IP
+          copy:
+            dest: /etc/netplan/99-custom.yaml
+            content: |
+              network:
+                version: 2
+                ethernets:
+                  eth0:
+                    dhcp4: no
+                    dhcp6: no
+                    addresses:
+                      - {{ node_ip }}/24
+                    gateway4: {{ gateway }}
+                    nameservers:
+                      addresses: {{ dns_servers | to_nice_json }}
+            mode: '0644'
+          register: netplan_config
+
+        - name: Apply netplan configuration
+          shell: netplan apply
+          when: netplan_config.changed
+
+    - name: Also update legacy interfaces file for compatibility
+      copy:
+        dest: /etc/network/interfaces
+        content: |
+          # interfaces(5) file used by ifup(8) and ifdown(8)
+          # Include files from /etc/network/interfaces.d:
+          source /etc/network/interfaces.d/*
+
+          auto eth0
+          iface eth0 inet static
+          address {{ node_ip }}
+          netmask {{ netmask }}
+          gateway {{ gateway }}
+          dns-nameservers {{ dns_servers | join(' ') }}
+        mode: '0644'
+
+    - name: Update hostname to match node name
+      lineinfile:
+        path: /etc/hostname
+        regexp: '^.*'
+        line: "{{ inventory_hostname }}"
+        create: yes
+
+    - name: Update hosts entry for localhost
+      lineinfile:
+        path: /etc/hosts
+        regexp: '^127\.0\.0\.1'
+        line: "127.0.0.1 localhost {{ inventory_hostname }}"
+        state: present
+
+    - name: Configuration complete - prompt for reboot
+      debug:
+        msg: |
+          ====== Network Configuration Applied ======
+          Node: {{ inventory_hostname }}
+          IP Address: {{ node_ip }}
+          Netmask: {{ netmask }}
+          Gateway: {{ gateway }}
+
+          IMPORTANT: You must reboot this node for changes to take effect!
+          Run: ansible {{ inventory_hostname }} -m shell -a "shutdown -r now" -b
+
+          Then verify connectivity with: ansible {{ inventory_hostname }} -m ping -i <inventory_file>

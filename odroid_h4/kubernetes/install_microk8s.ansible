@@ -1,0 +1,143 @@
+---
+# Install MicroK8s on Odroid H4 nodes (Intel Ubuntu)
+# MicroK8s is a lightweight, single-command Kubernetes installation
+# Usage: ansible-playbook install_microk8s.ansible
+# Usage (single node): ansible-playbook install_microk8s.ansible -l pc0
+
+- hosts: cluster
+  gather_facts: yes
+  become: yes
+
+  vars:
+    microk8s_channel: "stable"  # or 1.28, 1.27, etc for specific versions
+    microk8s_addons:
+      - dns
+      - storage
+      - ingress
+      - rbac
+
+  tasks:
+    - name: Update package manager cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required system packages
+      apt:
+        name:
+          - snapd
+          - curl
+          - net-tools
+          - vim
+        state: present
+
+    - name: Check if snapd is running
+      systemd:
+        name: snapd
+        state: started
+        enabled: yes
+
+    - name: Install MicroK8s
+      shell: snap install microk8s --classic --channel={{ microk8s_channel }}
+      ignore_errors: yes
+      register: microk8s_install
+
+    - name: Wait for MicroK8s to be ready
+      shell: microk8s status --wait-ready
+      retries: 30
+      delay: 10
+      register: microk8s_status
+
+    - name: Check MicroK8s status
+      shell: microk8s status
+      register: status_output
+
+    - name: Display MicroK8s status
+      debug:
+        msg: "{{ status_output.stdout_lines }}"
+
+    - name: Enable required addons
+      shell: microk8s enable {{ item }}
+      loop: "{{ microk8s_addons }}"
+      ignore_errors: yes
+      register: addon_results
+
+    - name: Add picocluster user to microk8s group
+      user:
+        name: picocluster
+        groups: microk8s
+        append: yes
+
+    - name: Create .kube directory for picocluster
+      file:
+        path: /home/picocluster/.kube
+        state: directory
+        owner: picocluster
+        group: picocluster
+        mode: '0755'
+
+    - name: Copy MicroK8s config for picocluster user
+      shell: |
+        microk8s config > /home/picocluster/.kube/config
+        chown picocluster:picocluster /home/picocluster/.kube/config
+        chmod 600 /home/picocluster/.kube/config
+
+    - name: Create symlink for kubectl
+      shell: |
+        ln -sf /snap/bin/microk8s.kubectl /usr/local/bin/kubectl
+      ignore_errors: yes
+
+    - name: Create symlink for helm
+      shell: |
+        ln -sf /snap/bin/microk8s.helm /usr/local/bin/helm
+      ignore_errors: yes
+
+    - name: Display MicroK8s setup instructions
+      debug:
+        msg: |
+          ====== MicroK8s Installation Complete ======
+
+          MicroK8s is now running on {{ inventory_hostname }}
+
+          Common commands:
+            microk8s status        - Check MicroK8s status
+            microk8s kubectl get pods -A  - List all pods
+            microk8s kubectl get nodes    - List cluster nodes
+            microk8s enable <addon>       - Enable additional features
+            microk8s disable <addon>      - Disable features
+
+          Available addons: dns, storage, ingress, rbac, metallb, dashboard, etc.
+
+          To use kubectl directly:
+            1. Run: microk8s config > ~/.kube/config
+            2. Or use: microk8s kubectl <commands>
+
+          kubeconfig location: /home/picocluster/.kube/config
+
+          Enabled addons:
+          {% for addon in microk8s_addons %}
+            - {{ addon }}
+          {% endfor %}
+
+  # For cluster setup, add joining capability
+- hosts: worker
+  gather_facts: yes
+  become: yes
+  ignore_errors: yes
+
+  tasks:
+    - name: Check if this is a worker node in a cluster
+      debug:
+        msg: "Worker node {{ inventory_hostname }} ready for cluster joining"
+
+    - name: Get join command from master
+      block:
+        - name: Get join token from master
+          shell: microk8s add-node
+          delegate_to: "{{ groups['master'][0] }}"
+          register: join_token
+
+        - name: Join this node to cluster
+          shell: "{{ join_token.stdout_lines[-1] }}"
+
+      when: groups['master'] is defined and groups['master'] | length > 0

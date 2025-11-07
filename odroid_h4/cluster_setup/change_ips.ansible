@@ -1,0 +1,100 @@
+---
+# Change IP addresses across all nodes and update hosts file
+# Usage: ansible-playbook change_ips.ansible -e "cluster_size=5 start_ip_octet=240"
+# For Pico3/5/10: start_ip_octet=240 (default)
+# For Pico20: start_ip_octet=230
+#
+# This script will assign IPs as follows:
+# cluster_size=3, start_ip_octet=240  -> pc0=10.1.10.240, pc1=10.1.10.241, pc2=10.1.10.242
+# cluster_size=20, start_ip_octet=230 -> pc0=10.1.10.230, ..., pc9=10.1.10.239, pc10=10.1.10.240, ..., pc19=10.1.10.249
+
+- hosts: localhost
+  gather_facts: yes
+  become: yes
+
+  vars:
+    base_network: "10.1.10"
+    start_ip_octet: "{{ start_ip_octet | default(240) }}"
+    cluster_size: "{{ cluster_size | default(5) }}"
+    gateway: "10.1.10.1"
+    netmask: "255.255.255.0"
+
+  pre_tasks:
+    - name: Validate cluster_size parameter
+      assert:
+        that:
+          - cluster_size | int > 0
+          - cluster_size | int <= 24
+        fail_msg: "cluster_size must be between 1 and 24"
+
+  tasks:
+    # Generate IP addresses for all nodes in the cluster
+    - name: Generate IP address mapping for all nodes
+      set_fact:
+        node_ips: "{{ node_ips | default([]) + [{'name': 'pc' + item | string, 'ip': base_network + '.' + ((start_ip_octet | int + item) | string)}] }}"
+      loop: "{{ range(0, cluster_size | int) }}"
+
+    # Update /etc/hosts with all node entries
+    - name: Update /etc/hosts with node mappings
+      lineinfile:
+        path: /etc/hosts
+        regexp: "^10\\.1\\.10\\..*\\s+{{ item.name }}"
+        line: "{{ item.ip }} {{ item.name }}"
+        state: present
+        create: yes
+      loop: "{{ node_ips }}"
+
+    # Create/update network interfaces for each node
+    - name: Create network configuration for each node
+      block:
+        - name: Create interfaces.d directory if it doesn't exist
+          file:
+            path: /etc/network/interfaces.d
+            state: directory
+            mode: '0755'
+
+        - name: Generate network config for each node to be applied via Ansible to remote nodes
+          template:
+            src: /dev/stdin
+            dest: "/tmp/network_config_{{ item.name }}.yaml"
+            owner: root
+            group: root
+            mode: '0644'
+          loop: "{{ node_ips }}"
+          vars:
+            node_name: "{{ item.name }}"
+            node_ip: "{{ item.ip }}"
+            template_content: |
+              auto eth0
+              iface eth0 inet static
+              address {{ item.ip }}
+              netmask {{ netmask }}
+              gateway {{ gateway }}
+              dns-nameservers {{ gateway }} 8.8.8.8
+
+    - name: Display node configuration summary
+      debug:
+        msg: "Node {{ item.name }} will be configured with IP {{ item.ip }}"
+      loop: "{{ node_ips }}"
+
+    - name: Instructions for applying network changes
+      debug:
+        msg: |
+          ====== IP Configuration Summary ======
+          Base Network: {{ base_network }}.0/24
+          Start IP Octet: {{ start_ip_octet }}
+          Cluster Size: {{ cluster_size }}
+          Gateway: {{ gateway }}
+
+          Node IP Assignments:
+          {% for node in node_ips %}
+          {{ node.name }}: {{ node.ip }}
+          {% endfor %}
+
+          NEXT STEPS:
+          1. Review the IP assignments above
+          2. For each node in your cluster, run the following to apply network changes:
+             ansible-playbook apply_network_config.ansible -l <node_name> -e "node_ip=10.1.10.X"
+
+          3. Reboot each node: ansible all -m shell -a "shutdown -r now" -l cluster
+          4. Verify connectivity with: ansible all -m ping -l cluster
