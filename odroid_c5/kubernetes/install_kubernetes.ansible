@@ -1,0 +1,181 @@
+---
+- hosts: cluster
+  become: yes
+  vars:
+      join_command_location: "./join_command.out"
+
+  tasks:
+    - name: Update cache to make sure everything is fresh
+      apt:
+        update_cache: yes
+
+    - name: Check to see if Docker is already installed
+      shell: dpkg-query -W 'docker-ce'
+      ignore_errors: True
+      register: is_docker
+
+    # Docker install. Skip if already installed
+    - block:
+        - name: Make sure certificates are installed and updated
+          apt: name={{ item }} state=present
+          with_items:
+            - apt-transport-https
+            - ca-certificates
+            - software-properties-common
+
+        - name: Install Docker repository key
+          shell: "curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add -"
+
+        - name: Add Docker source for apt
+          lineinfile:
+            dest: /etc/apt/sources.list.d/docker.list
+            line: "deb [arch=arm64] https://download.docker.com/linux/ubuntu bionic stable"
+            create: yes
+
+        - name: Update cache to get Docker
+          apt:
+            update_cache: yes
+
+        - name: Install Docker
+          apt: name={{ item }} state=present
+          with_items:
+            - docker-ce=18.06.3~ce~3-0~ubuntu
+            - containerd.io
+
+        - name: hold docker.io so it's not upgraded
+          shell: "apt-mark hold docker-ce"
+
+        - name: Append picocluster to docker Group
+          user:
+            name: picocluster
+            groups: docker
+            append: yes
+          register: group
+      when: is_docker is failed
+
+    - name: Check to see if Kubernetes is already installed
+      shell: dpkg-query -W 'kubeadm'
+      ignore_errors: True
+      register: is_kubernetes
+
+    # Kubernetes install. Skip if already installed
+    - block:
+        - name: Install Kubernetes repository key
+          shell: "curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -"
+
+        - name: Add Kubernetes source for apt
+          lineinfile:
+            dest: /etc/apt/sources.list.d/kubernetes.list
+            line: "deb http://apt.kubernetes.io/ kubernetes-xenial main"
+            create: yes
+
+        - name: Update cache to get kubernetes
+          apt:
+            update_cache: yes
+
+        - name: Install Kubernetes
+          apt: name={{ item }} state=present
+          with_items:
+            - kubeadm=1.9.4-00
+            - kubectl=1.9.4-00
+            - kubelet=1.9.4-00
+            - kubernetes-cni=0.6.0-00
+          register: kubernetes_install
+
+        - name: hold kubelet kubeadm kubectl so they are not upgraded
+          shell: "apt-mark hold kubelet kubeadm kubectl"
+          register: kubernetes_install
+
+      when: is_kubernetes is failed
+
+    - block:
+        # Create Kubernetes cluster and save join command to file
+        - block:
+            - name: Init kubernetes
+              command: "kubeadm init --pod-network-cidr 10.244.0.0/16"
+              register: kube_init
+
+            - name: Extract join command
+              command: "kubeadm token create --print-join-command"
+              register: join_command
+
+            - name: Save join command
+              local_action: copy content={{ join_command.stdout_lines | last  | trim }} dest="{{ join_command_location }}"
+
+            - name: Copy join command to worker nodes 
+              synchronize:
+                src: "{{ join_command_location }}"
+                dest: "{{ join_command_location }}"
+          when: "'master' in group_names"
+
+        # Some additional setup for the control user on master
+        - block:
+            - name: Remove .kube directory if it exists
+              file:
+                path: "$HOME/.kube"
+                state: absent
+
+            - name: Copy kube admin config to user
+              shell: "mkdir -p $HOME/.kube"
+
+            - shell: "sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config"
+
+            - shell: "sudo chown $(id -u):$(id -g) $HOME/.kube/config"
+
+            - name: Set up flannel networking
+              shell: "curl -sSL https://rawgit.com/coreos/flannel/v0.11.0/Documentation/kube-flannel.yml | sed 's/amd64/arm64/g' | kubectl create -f -"
+              ignore_errors: True
+
+            - name: Check to see if flannel network is defined
+              stat:
+                path: /etc/cni/net.d/10-flannel.conf
+              register: stat_result
+ 
+            - name: Create the flannel network if missing
+              blockinfile:
+                dest: /etc/cni/net.d/10-flannel.conf
+                block: |
+                       {
+                         "name": "cbr0",
+                         "type": "flannel", 
+                         "delegate": {
+                           "isDefaultGateway": true
+                         }
+                       }
+                create: yes
+              become: yes
+              ignore_errors: True
+              when: stat_result.stat.exists == false
+
+          become: no
+          when: "'master' in group_names"
+
+        # Read the join command on the workers and join the cluster
+        - block:
+            - name: Read join command on worker nodes
+              debug: msg="{{ lookup('file', join_command_location) }}"
+              register: join_command_local
+              when: "'worker' in group_names"
+
+            - name: Join Workers to cluster
+              command: "{{ join_command_local.msg }}"
+              when: "'worker' in group_names"
+          when: (kube_init is success) and (join_command is defined)
+      
+      when: (is_kubernetes is success) or (kubernetes_install is success)
+
+
+    # Wait a few seconds, then print the output of the Kubernetes cluster status. All nodes should have joined.
+    - block:
+        - name: Wait 60 seconds for Kubernetes to stabilize
+          wait_for: 
+            timeout: 60
+
+        - name: Retrieve the  cluster status and show it
+          shell: kubectl get nodes
+          register: kubernetes_status
+          become: no
+
+        - debug: var=kubernetes_status.stdout_lines
+      when: "'master' in group_names"
+

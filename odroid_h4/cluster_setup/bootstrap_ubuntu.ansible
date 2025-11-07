@@ -1,0 +1,92 @@
+---
+- hosts: localhost
+  gather_facts: yes
+  become: yes
+
+  tasks:
+    # Add picocluster group and user and add sudo access
+    - name: Add sudo for picocluster
+      lineinfile:
+        dest: /etc/sudoers
+        regexp: '^%picocluster'
+        line: 'picocluster ALL=(ALL) NOPASSWD: ALL'
+        state: present
+
+    - name: Make sure certificates are installed and updated
+      apt:
+        name: ['curl', 'ca-certificates']
+        state: present
+
+    - name: Make sure the Pictures directory exists
+      file:
+        path: /home/picocluster/Pictures
+        state: directory
+        owner: picocluster
+        group: picocluster
+        mode: '0755'
+
+    - name: Pull down picocluster background image from github
+      get_url:
+        url: https://raw.githubusercontent.com/picocluster/ApplicationSets/master/common/PicoCluster_Background.png
+        dest: /home/picocluster/Pictures/PicoCluster_Background.png
+        owner: picocluster
+        group: picocluster
+        mode: '0440'
+
+    # Configure network setting
+    - name: Change hostname to pc0
+      lineinfile:
+        dest: /etc/hostname
+        regexp: '^ubuntu'
+        line: 'pc0'
+        state: present
+
+    - name: Add host mappings to /etc/hosts
+      blockinfile:
+        dest: /etc/hosts
+        block: |
+          {{ item.ip }} {{ item.name }}
+        marker: "# {mark} ANSIBLE MANAGED BLOCK {{ item.name }}"
+      with_items:
+      - { name: pc0, ip: 10.1.10.200 }
+      - { name: pc1, ip: 10.1.10.201 }
+      - { name: pc2, ip: 10.1.10.202 }
+      - { name: pc3, ip: 10.1.10.203 }
+      - { name: pc4, ip: 10.1.10.204 }
+      - { name: pc5, ip: 10.1.10.205 }
+
+
+    - name: Make sure ansible directory exists
+      file:
+        path: /etc/ansible
+        state: directory
+
+    - name: Add our ansible hosts setup
+      copy:
+        dest: /etc/ansible/hosts
+        content: |
+          # This is the default ansible 'hosts' file.
+          #
+          # It should live in /etc/ansible/hosts
+          #
+          #   - Comments begin with the '#' character
+          #   - Blank lines are ignored
+          #   - Groups of hosts are delimited by [header] elements
+          #   - You can enter hostnames or ip addresses
+          #   - A hostname/ip can be a member of multiple groups
+
+          # Ungrouped
+          pc[0:23]
+
+          # cluster node
+          [cluster]
+          pc[0:23]
+
+          # master
+          [master]
+          pc0
+
+          # worker
+          [worker]
+          pc[1:23]
+

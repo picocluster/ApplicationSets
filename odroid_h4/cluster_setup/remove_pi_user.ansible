@@ -1,0 +1,17 @@
+---
+- hosts: localhost
+  become: yes
+
+  tasks:
+    # Remove the pi user
+    - name: Remove the user pi
+      user:
+        name: pi
+        state: absent
+        remove: yes
+
+    - name: Remove pi group
+      group:
+        name: pi
+        state: absent
+
