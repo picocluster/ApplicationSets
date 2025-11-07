@@ -1,0 +1,317 @@
+---
+# Install Kubernetes with containerd on a cluster of RPI5 nodes (Raspbian/Debian)
+# Usage: ansible-playbook install_kubernetes_containerd_cluster_raspbian.ansible
+
+- hosts: cluster
+  gather_facts: yes
+  become: yes
+
+  vars:
+    kubernetes_version: "1.28"
+    pod_network_cidr: "10.244.0.0/16"
+    join_command_file: "/tmp/kubeadm_join_command.sh"
+
+  tasks:
+    - name: Update package manager cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required system packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - software-properties-common
+          - net-tools
+          - vim
+        state: present
+
+    # containerd installation
+    - name: Check if containerd is already installed
+      shell: which containerd
+      ignore_errors: yes
+      register: containerd_check
+
+    - name: Install and configure containerd on Raspbian
+      block:
+        - name: Add Docker's official GPG key
+          shell: curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+
+        - name: Add Docker repository for Debian (Raspbian)
+          lineinfile:
+            path: /etc/apt/sources.list.d/docker.list
+            line: "deb [arch=arm64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/debian {{ ansible_distribution_release }} stable"
+            create: yes
+
+        - name: Update package cache
+          apt:
+            update_cache: yes
+
+        - name: Install containerd
+          apt:
+            name:
+              - containerd.io
+            state: present
+
+        - name: Create containerd config directory
+          file:
+            path: /etc/containerd
+            state: directory
+            mode: '0755'
+
+        - name: Generate default containerd configuration
+          shell: containerd config default | tee /etc/containerd/config.toml
+
+        - name: Enable systemd cgroup driver in containerd config
+          blockinfile:
+            path: /etc/containerd/config.toml
+            marker: "# {mark} ANSIBLE MANAGED - systemd cgroup"
+            block: |
+              [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+                runtime_type = "io.containerd.runc.v2"
+                [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+                  SystemdCgroup = true
+            insertafter: '\[plugins\."io.containerd.grpc.v1.cri".containerd.runtimes\]'
+
+        - name: Enable and start containerd
+          systemd:
+            name: containerd
+            enabled: yes
+            state: restarted
+
+      when: containerd_check is failed
+
+    # Load required kernel modules
+    - name: Load overlay kernel module
+      modprobe:
+        name: overlay
+        state: present
+
+    - name: Load br_netfilter kernel module
+      modprobe:
+        name: br_netfilter
+        state: present
+
+    - name: Persist kernel modules
+      copy:
+        dest: /etc/modules-load.d/kubernetes.conf
+        content: |
+          overlay
+          br_netfilter
+        mode: '0644'
+
+    - name: Configure kernel parameters for Kubernetes
+      copy:
+        dest: /etc/sysctl.d/99-kubernetes.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward = 1
+        mode: '0644'
+      register: sysctl_config
+
+    - name: Apply sysctl settings
+      shell: sysctl --system
+      when: sysctl_config.changed
+
+    - name: Disable swap
+      shell: swapoff -a
+
+    - name: Comment out swap in /etc/fstab
+      lineinfile:
+        path: /etc/fstab
+        regexp: '^\s*[^#].*\sswap\s'
+        line: '# \g<0>'
+        backrefs: yes
+
+    # Kubernetes installation
+    - name: Check if kubeadm is already installed
+      shell: which kubeadm
+      ignore_errors: yes
+      register: kubeadm_check
+
+    - name: Install Kubernetes components on all nodes
+      block:
+        - name: Add Kubernetes official GPG key
+          shell: curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/kubernetes-archive-keyring.gpg
+
+        - name: Add Kubernetes repository
+          lineinfile:
+            path: /etc/apt/sources.list.d/kubernetes.list
+            line: "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main"
+            create: yes
+
+        - name: Update package cache
+          apt:
+            update_cache: yes
+
+        - name: Install Kubernetes components
+          apt:
+            name:
+              - kubelet
+              - kubeadm
+              - kubectl
+            state: present
+
+        - name: Hold Kubernetes packages to prevent auto-upgrade
+          shell: apt-mark hold kubelet kubeadm kubectl
+
+        - name: Enable kubelet service
+          systemd:
+            name: kubelet
+            enabled: yes
+
+      when: kubeadm_check is failed
+
+  # Master node initialization
+- hosts: master
+  gather_facts: yes
+  become: yes
+
+  vars:
+    pod_network_cidr: "10.244.0.0/16"
+    join_command_file: "/tmp/kubeadm_join_command.sh"
+
+  tasks:
+    - name: Check if cluster is already initialized
+      shell: test -f /etc/kubernetes/admin.conf
+      ignore_errors: yes
+      register: cluster_init_check
+
+    - name: Initialize Kubernetes cluster on master
+      block:
+        - name: Initialize kubeadm
+          shell: |
+            kubeadm init \
+              --pod-network-cidr={{ pod_network_cidr }} \
+              --cri-socket=/run/containerd/containerd.sock \
+              --apiserver-advertise-address="{{ ansible_default_ipv4.address }}"
+          register: kubeadm_init
+
+        - name: Create .kube directory for root
+          file:
+            path: /root/.kube
+            state: directory
+            owner: root
+            group: root
+            mode: '0755'
+
+        - name: Copy admin config for root
+          shell: |
+            cp /etc/kubernetes/admin.conf /root/.kube/config
+            chown $(id -u):$(id -g) /root/.kube/config
+
+        - name: Create .kube directory for pi user
+          file:
+            path: /home/pi/.kube
+            state: directory
+            owner: pi
+            group: pi
+            mode: '0755'
+
+        - name: Copy admin config for pi user
+          shell: |
+            cp /etc/kubernetes/admin.conf /home/pi/.kube/config
+            chown pi:pi /home/pi/.kube/config
+
+        - name: Generate join command for worker nodes
+          shell: kubeadm token create --print-join-command
+          register: join_command
+
+        - name: Save join command to file for distribution
+          copy:
+            content: "{{ join_command.stdout }}"
+            dest: "{{ join_command_file }}"
+            owner: root
+            group: root
+            mode: '0644'
+          delegate_to: localhost
+
+      when: cluster_init_check is failed
+
+    - name: Install Flannel network plugin
+      block:
+        - name: Check if Flannel is already installed
+          shell: kubectl get daemonset -n kube-flannel flannel 2>/dev/null || echo "not installed"
+          ignore_errors: yes
+          register: flannel_check
+
+        - name: Apply Flannel manifest
+          shell: |
+            kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+          environment:
+            KUBECONFIG: /root/.kube/config
+          when: '"not installed" in flannel_check.stdout'
+
+      when: cluster_init_check is failed
+
+  # Worker node joining
+- hosts: worker
+  gather_facts: yes
+  become: yes
+
+  vars:
+    join_command_file: "/tmp/kubeadm_join_command.sh"
+
+  tasks:
+    - name: Check if node is already part of cluster
+      shell: test -f /etc/kubernetes/kubelet.conf
+      ignore_errors: yes
+      register: node_joined_check
+
+    - name: Join worker nodes to cluster
+      block:
+        - name: Wait for join command to be available
+          wait_for:
+            path: "{{ join_command_file }}"
+            timeout: 300
+          delegate_to: localhost
+
+        - name: Read join command from file
+          shell: cat "{{ join_command_file }}"
+          delegate_to: localhost
+          register: join_command
+          changed_when: false
+
+        - name: Join node to cluster
+          shell: |
+            {{ join_command.stdout }} \
+              --cri-socket=/run/containerd/containerd.sock
+          register: join_result
+
+        - name: Wait for node to be ready
+          shell: |
+            kubectl get nodes {{ inventory_hostname }} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' | grep -q True
+          environment:
+            KUBECONFIG: /root/.kube/config
+          delegate_to: "{{ groups['master'][0] }}"
+          retries: 30
+          delay: 10
+          changed_when: false
+
+      when: node_joined_check is failed
+
+  # Final verification
+- hosts: master
+  gather_facts: yes
+
+  tasks:
+    - name: Display cluster status
+      shell: |
+        kubectl get nodes
+        echo ""
+        echo "Kubernetes cluster is ready!"
+        echo "Master node: {{ inventory_hostname }}"
+        echo ""
+        echo "To check all pods:"
+        echo "  kubectl get pods --all-namespaces"
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: cluster_status
+
+    - name: Cluster setup complete
+      debug:
+        msg: "{{ cluster_status.stdout_lines }}"

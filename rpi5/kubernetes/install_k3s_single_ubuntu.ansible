@@ -1,0 +1,132 @@
+---
+# Install K3s (lightweight Kubernetes) on a single RPI5 node (Ubuntu)
+# Usage: ansible-playbook install_k3s_single_ubuntu.ansible -l pc0
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    k3s_version: "latest"
+    k3s_install_dir: "/usr/local/bin"
+
+  tasks:
+    - name: Update package manager cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required system packages
+      apt:
+        name:
+          - curl
+          - wget
+          - net-tools
+          - vim
+          - jq
+        state: present
+
+    - name: Disable swap (required for Kubernetes)
+      shell: swapoff -a
+
+    - name: Comment out swap in /etc/fstab
+      lineinfile:
+        path: /etc/fstab
+        regexp: '^\s*[^#].*\sswap\s'
+        line: '# \g<0>'
+        backrefs: yes
+
+    - name: Check if K3s is already installed
+      shell: which k3s
+      ignore_errors: yes
+      register: k3s_check
+
+    - name: Install K3s
+      block:
+        - name: Download and install K3s installer script
+          shell: |
+            curl -sfL https://get.k3s.io | sh -
+          environment:
+            INSTALL_K3S_VERSION: "{{ k3s_version }}"
+            INSTALL_K3S_EXEC: "server --disable traefik --disable servicelb"
+          register: k3s_install
+
+        - name: Enable and start K3s service
+          systemd:
+            name: k3s
+            enabled: yes
+            state: started
+
+        - name: Wait for K3s to be ready
+          shell: k3s kubectl get nodes
+          retries: 30
+          delay: 10
+          changed_when: false
+
+      when: k3s_check is failed
+
+    - name: Create .kube directory for root user
+      file:
+        path: /root/.kube
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Copy K3s kubeconfig for root
+      shell: |
+        mkdir -p /root/.kube
+        cp /etc/rancher/k3s/k3s.yaml /root/.kube/config
+        chown $(id -u):$(id -g) /root/.kube/config
+        chmod 600 /root/.kube/config
+      environment:
+        KUBECONFIG: /root/.kube/config
+
+    - name: Create .kube directory for pi user
+      file:
+        path: /home/pi/.kube
+        state: directory
+        owner: pi
+        group: pi
+        mode: '0755'
+
+    - name: Copy K3s kubeconfig for pi user
+      shell: |
+        cp /etc/rancher/k3s/k3s.yaml /home/pi/.kube/config
+        chown pi:pi /home/pi/.kube/config
+        chmod 600 /home/pi/.kube/config
+
+    - name: Create kubectl symlink for convenience
+      shell: |
+        ln -sf /usr/local/bin/k3s /usr/local/bin/kubectl
+      ignore_errors: yes
+
+    - name: Display K3s installation status
+      shell: k3s kubectl get nodes -o wide
+      register: nodes_status
+
+    - name: Show completion message
+      debug:
+        msg: |
+          ====== K3s Single-Node Installation Complete ======
+
+          Node: {{ inventory_hostname }}
+          K3s Version: {{ k3s_version }}
+
+          Cluster Status:
+          {{ nodes_status.stdout }}
+
+          kubeconfig locations:
+            - /root/.kube/config
+            - /home/pi/.kube/config
+
+          Useful commands:
+            k3s kubectl get nodes
+            k3s kubectl get pods --all-namespaces
+            k3s kubectl cluster-info
+
+          Or use kubectl directly (symlink):
+            kubectl get nodes
+            kubectl get pods -A
+
+          K3s is lightweight and ready for deployment!

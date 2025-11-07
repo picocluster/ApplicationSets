@@ -1,0 +1,256 @@
+---
+# Install Kubernetes with containerd on a single RPI5 node (Ubuntu)
+# Usage: ansible-playbook install_kubernetes_containerd_single_ubuntu.ansible -l pc0
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    kubernetes_version: "1.28"
+    pod_network_cidr: "10.244.0.0/16"
+
+  tasks:
+    - name: Update package manager cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required system packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - software-properties-common
+          - net-tools
+          - vim
+        state: present
+
+    # containerd installation
+    - name: Check if containerd is already installed
+      shell: which containerd
+      ignore_errors: yes
+      register: containerd_check
+
+    - name: Install containerd
+      block:
+        - name: Add Docker's official GPG key
+          shell: curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+
+        - name: Add Docker repository
+          lineinfile:
+            path: /etc/apt/sources.list.d/docker.list
+            line: "deb [arch=arm64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+            create: yes
+
+        - name: Update package cache
+          apt:
+            update_cache: yes
+
+        - name: Install containerd
+          apt:
+            name:
+              - containerd.io
+            state: present
+
+        - name: Create containerd config directory
+          file:
+            path: /etc/containerd
+            state: directory
+            mode: '0755'
+
+        - name: Generate default containerd configuration
+          shell: containerd config default | tee /etc/containerd/config.toml
+
+        - name: Update containerd to use systemd cgroup
+          blockinfile:
+            path: /etc/containerd/config.toml
+            marker: "# {mark} ANSIBLE MANAGED BLOCK - systemd cgroup"
+            block: |
+              [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+                runtime_type = "io.containerd.runc.v2"
+                [plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+                  SystemdCgroup = true
+            insertafter: '\[plugins\."io.containerd.grpc.v1.cri".containerd.runtimes\]'
+
+        - name: Enable and start containerd
+          systemd:
+            name: containerd
+            enabled: yes
+            state: restarted
+
+      when: containerd_check is failed
+
+    # Load required kernel modules
+    - name: Load overlay kernel module
+      modprobe:
+        name: overlay
+        state: present
+
+    - name: Load br_netfilter kernel module
+      modprobe:
+        name: br_netfilter
+        state: present
+
+    - name: Persist kernel modules
+      copy:
+        dest: /etc/modules-load.d/kubernetes.conf
+        content: |
+          overlay
+          br_netfilter
+        mode: '0644'
+
+    - name: Configure kernel parameters for Kubernetes
+      copy:
+        dest: /etc/sysctl.d/99-kubernetes.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward = 1
+        mode: '0644'
+      register: sysctl_config
+
+    - name: Apply sysctl settings
+      shell: sysctl --system
+      when: sysctl_config.changed
+
+    - name: Disable swap
+      shell: swapoff -a
+
+    - name: Comment out swap in /etc/fstab
+      lineinfile:
+        path: /etc/fstab
+        regexp: '^\s*[^#].*\sswap\s'
+        line: '# \g<0>'
+        backrefs: yes
+
+    # Kubernetes installation
+    - name: Check if kubeadm is already installed
+      shell: which kubeadm
+      ignore_errors: yes
+      register: kubeadm_check
+
+    - name: Install Kubernetes components
+      block:
+        - name: Add Kubernetes official GPG key
+          shell: curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | gpg --dearmor -o /usr/share/keyrings/kubernetes-archive-keyring.gpg
+
+        - name: Add Kubernetes repository
+          lineinfile:
+            path: /etc/apt/sources.list.d/kubernetes.list
+            line: "deb [signed-by=/usr/share/keyrings/kubernetes-archive-keyring.gpg] https://apt.kubernetes.io/ kubernetes-xenial main"
+            create: yes
+
+        - name: Update package cache
+          apt:
+            update_cache: yes
+
+        - name: Install Kubernetes components
+          apt:
+            name:
+              - kubelet
+              - kubeadm
+              - kubectl
+            state: present
+
+        - name: Hold Kubernetes packages to prevent auto-upgrade
+          shell: apt-mark hold kubelet kubeadm kubectl
+
+        - name: Enable kubelet service
+          systemd:
+            name: kubelet
+            enabled: yes
+
+      when: kubeadm_check is failed
+
+    # Initialize Kubernetes cluster on this single node
+    - name: Check if cluster is already initialized
+      shell: test -f /etc/kubernetes/admin.conf
+      ignore_errors: yes
+      register: cluster_init_check
+
+    - name: Initialize Kubernetes cluster
+      block:
+        - name: Initialize kubeadm
+          shell: |
+            kubeadm init \
+              --pod-network-cidr={{ pod_network_cidr }} \
+              --cri-socket=/run/containerd/containerd.sock
+          register: kubeadm_init_result
+
+        - name: Create .kube directory for root user
+          file:
+            path: /root/.kube
+            state: directory
+            owner: root
+            group: root
+            mode: '0755'
+
+        - name: Copy kubernetes config for root
+          shell: |
+            cp /etc/kubernetes/admin.conf /root/.kube/config
+            chown $(id -u):$(id -g) /root/.kube/config
+
+        - name: Create .kube directory for pi user
+          file:
+            path: /home/pi/.kube
+            state: directory
+            owner: pi
+            group: pi
+            mode: '0755'
+
+        - name: Copy kubernetes config for pi user
+          shell: |
+            cp /etc/kubernetes/admin.conf /home/pi/.kube/config
+            chown pi:pi /home/pi/.kube/config
+
+        - name: Allow pi to access kubernetes
+          shell: |
+            usermod -aG docker pi
+
+      when: cluster_init_check is failed
+
+    # Install Flannel CNI
+    - name: Install Flannel network plugin
+      block:
+        - name: Check if Flannel is already installed
+          shell: kubectl get daemonset -n kube-flannel flannel
+          ignore_errors: yes
+          register: flannel_check
+
+        - name: Apply Flannel network policy
+          shell: |
+            kubectl apply -f https://raw.githubusercontent.com/coreos/flannel/master/Documentation/kube-flannel.yml
+          environment:
+            KUBECONFIG: /root/.kube/config
+          when: flannel_check is failed
+
+      when: cluster_init_check is failed
+
+    # Untaint master node to allow pod scheduling
+    - name: Taint master node for single-node setup
+      shell: |
+        kubectl taint nodes --all node-role.kubernetes.io/master- 2>/dev/null || true
+        kubectl taint nodes --all node-role.kubernetes.io/control-plane- 2>/dev/null || true
+      environment:
+        KUBECONFIG: /root/.kube/config
+      when: cluster_init_check is failed
+
+    - name: Display completion message
+      debug:
+        msg: |
+          ====== Kubernetes Installation Complete ======
+
+          Cluster initialized on {{ inventory_hostname }}
+
+          To verify the installation:
+            kubectl get nodes
+            kubectl get pods --all-namespaces
+
+          The kubeconfig is available at:
+            - /root/.kube/config
+            - /home/pi/.kube/config
+
+          You can now deploy applications to your single-node cluster!

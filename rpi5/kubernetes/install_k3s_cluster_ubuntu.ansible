@@ -1,0 +1,226 @@
+---
+# Install K3s cluster on RPI5 nodes (Ubuntu)
+# Usage: ansible-playbook install_k3s_cluster_ubuntu.ansible
+
+- hosts: cluster
+  gather_facts: yes
+  become: yes
+
+  vars:
+    k3s_version: "latest"
+    k3s_token_file: "/tmp/k3s_token"
+
+  pre_tasks:
+    - name: Validate master and worker groups exist
+      assert:
+        that:
+          - groups['master'] is defined
+          - groups['master'] | length > 0
+        fail_msg: "Must define [master] group in inventory"
+
+  # Prepare all nodes first
+- hosts: cluster
+  gather_facts: yes
+  become: yes
+
+  vars:
+    k3s_version: "latest"
+
+  tasks:
+    - name: Update package manager cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required system packages
+      apt:
+        name:
+          - curl
+          - wget
+          - net-tools
+          - vim
+          - jq
+        state: present
+
+    - name: Disable swap (required for Kubernetes)
+      shell: swapoff -a
+
+    - name: Comment out swap in /etc/fstab
+      lineinfile:
+        path: /etc/fstab
+        regexp: '^\s*[^#].*\sswap\s'
+        line: '# \g<0>'
+        backrefs: yes
+
+    - name: Check if K3s is already installed
+      shell: which k3s
+      ignore_errors: yes
+      register: k3s_check
+
+  # Initialize master node
+- hosts: master
+  gather_facts: yes
+  become: yes
+
+  vars:
+    k3s_version: "latest"
+    k3s_token_file: "/tmp/k3s_token"
+
+  tasks:
+    - name: Check if K3s server is already running
+      shell: test -f /etc/rancher/k3s/k3s.yaml
+      ignore_errors: yes
+      register: k3s_server_check
+
+    - name: Install K3s server on master
+      block:
+        - name: Download and install K3s server
+          shell: |
+            curl -sfL https://get.k3s.io | sh -
+          environment:
+            INSTALL_K3S_VERSION: "{{ k3s_version }}"
+            INSTALL_K3S_EXEC: "server --disable traefik --disable servicelb"
+          register: k3s_server_install
+
+        - name: Wait for K3s server to be ready
+          shell: k3s kubectl get nodes
+          retries: 30
+          delay: 10
+          changed_when: false
+
+        - name: Extract K3s node token
+          shell: cat /var/lib/rancher/k3s/server/node-token
+          register: k3s_node_token
+
+        - name: Save token for worker nodes
+          copy:
+            content: "{{ k3s_node_token.stdout }}"
+            dest: "{{ k3s_token_file }}"
+            owner: root
+            group: root
+            mode: '0644'
+          delegate_to: localhost
+
+      when: k3s_server_check is failed
+
+    - name: Create kubeconfig for users
+      block:
+        - name: Create .kube directory for root
+          file:
+            path: /root/.kube
+            state: directory
+            owner: root
+            group: root
+            mode: '0755'
+
+        - name: Copy K3s kubeconfig for root
+          shell: |
+            mkdir -p /root/.kube
+            cp /etc/rancher/k3s/k3s.yaml /root/.kube/config
+            chown $(id -u):$(id -g) /root/.kube/config
+            chmod 600 /root/.kube/config
+
+        - name: Create .kube directory for pi user
+          file:
+            path: /home/pi/.kube
+            state: directory
+            owner: pi
+            group: pi
+            mode: '0755'
+
+        - name: Copy K3s kubeconfig for pi user
+          shell: |
+            cp /etc/rancher/k3s/k3s.yaml /home/pi/.kube/config
+            chown pi:pi /home/pi/.kube/config
+            chmod 600 /home/pi/.kube/config
+
+  # Join worker nodes to cluster
+- hosts: worker
+  gather_facts: yes
+  become: yes
+
+  vars:
+    k3s_version: "latest"
+    k3s_token_file: "/tmp/k3s_token"
+
+  tasks:
+    - name: Check if K3s agent is already running
+      shell: test -f /etc/rancher/k3s/k3s-agent.env
+      ignore_errors: yes
+      register: k3s_agent_check
+
+    - name: Join worker nodes to cluster
+      block:
+        - name: Wait for token file to be available
+          wait_for:
+            path: "{{ k3s_token_file }}"
+            timeout: 300
+          delegate_to: localhost
+
+        - name: Read K3s node token
+          shell: cat "{{ k3s_token_file }}"
+          delegate_to: localhost
+          register: k3s_token
+          changed_when: false
+
+        - name: Get master node IP address
+          set_fact:
+            master_ip: "{{ hostvars[groups['master'][0]]['ansible_default_ipv4']['address'] }}"
+
+        - name: Install K3s agent on worker node
+          shell: |
+            curl -sfL https://get.k3s.io | sh -
+          environment:
+            INSTALL_K3S_VERSION: "{{ k3s_version }}"
+            INSTALL_K3S_URL: "https://{{ master_ip }}:6443"
+            INSTALL_K3S_TOKEN: "{{ k3s_token.stdout }}"
+            INSTALL_K3S_EXEC: "agent"
+          register: k3s_agent_install
+
+        - name: Wait for node to be ready
+          shell: |
+            k3s kubectl get nodes {{ inventory_hostname }} -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' | grep -q True
+          environment:
+            KUBECONFIG: /etc/rancher/k3s/k3s.yaml
+          delegate_to: "{{ groups['master'][0] }}"
+          retries: 30
+          delay: 10
+          changed_when: false
+
+      when: k3s_agent_check is failed
+
+  # Verify cluster is ready
+- hosts: master
+  gather_facts: yes
+
+  tasks:
+    - name: Display cluster status
+      shell: |
+        k3s kubectl get nodes -o wide
+        echo ""
+        echo "Cluster pods:"
+        k3s kubectl get pods --all-namespaces
+      environment:
+        KUBECONFIG: /root/.kube/config
+      register: cluster_status
+
+    - name: Show completion message
+      debug:
+        msg: |
+          ====== K3s Cluster Installation Complete ======
+
+          Master: {{ inventory_hostname }}
+          Workers: {{ groups['worker'] | join(', ') }}
+
+          {{ cluster_status.stdout }}
+
+          kubeconfig locations:
+            - /root/.kube/config (root)
+            - /home/pi/.kube/config (pi user)
+
+          Useful commands:
+            k3s kubectl get nodes
+            k3s kubectl get pods -A
+            k3s kubectl cluster-info
+
+          K3s cluster is ready for workloads!
