@@ -1,0 +1,140 @@
+---
+# Initialize Docker Swarm on RPI5 Ubuntu nodes
+# Usage: ansible-playbook setup_docker_swarm_ubuntu.ansible
+
+- hosts: cluster
+  gather_facts: yes
+  become: yes
+
+  vars:
+    swarm_token_file: "/tmp/docker_swarm_join_token.txt"
+    swarm_worker_token_file: "/tmp/docker_swarm_worker_token.txt"
+
+  pre_tasks:
+    - name: Validate master and worker groups exist
+      assert:
+        that:
+          - groups['master'] is defined
+          - groups['master'] | length > 0
+        fail_msg: "Must define [master] group in inventory"
+
+  # Initialize Swarm on Manager
+- hosts: master
+  gather_facts: yes
+  become: yes
+
+  vars:
+    swarm_token_file: "/tmp/docker_swarm_join_token.txt"
+    swarm_worker_token_file: "/tmp/docker_swarm_worker_token.txt"
+
+  tasks:
+    - name: Check if Swarm is already initialized
+      shell: docker info | grep -i "swarm:"
+      ignore_errors: yes
+      register: swarm_status
+
+    - name: Initialize Docker Swarm on manager
+      block:
+        - name: Initialize Swarm
+          shell: docker swarm init --advertise-addr {{ ansible_default_ipv4.address }}
+          register: swarm_init_result
+
+        - name: Get manager join token
+          shell: docker swarm join-token -q manager
+          register: manager_token
+
+        - name: Get worker join token
+          shell: docker swarm join-token -q worker
+          register: worker_token
+
+        - name: Save tokens to files for worker nodes
+          copy:
+            content: "{{ item.token }}"
+            dest: "{{ item.file }}"
+            owner: root
+            group: root
+            mode: '0644'
+          loop:
+            - { token: "{{ manager_token.stdout }}", file: "{{ swarm_token_file }}" }
+            - { token: "{{ worker_token.stdout }}", file: "{{ swarm_worker_token_file }}" }
+          delegate_to: localhost
+
+        - name: Display Swarm initialized
+          debug:
+            msg: |
+              Docker Swarm initialized on {{ inventory_hostname }}
+              Manager IP: {{ ansible_default_ipv4.address }}
+              To join other manager nodes: docker swarm join --token {{ manager_token.stdout }} {{ ansible_default_ipv4.address }}:2377
+              To join worker nodes: docker swarm join --token {{ worker_token.stdout }} {{ ansible_default_ipv4.address }}:2377
+
+      when: "'Swarm: active' not in swarm_status.stdout"
+
+  # Join Worker Nodes
+- hosts: worker
+  gather_facts: yes
+  become: yes
+
+  vars:
+    swarm_worker_token_file: "/tmp/docker_swarm_worker_token.txt"
+
+  tasks:
+    - name: Check if node is already part of Swarm
+      shell: docker info | grep -i "swarm:"
+      ignore_errors: yes
+      register: node_swarm_status
+
+    - name: Join worker nodes to Swarm
+      block:
+        - name: Wait for worker token file
+          wait_for:
+            path: "{{ swarm_worker_token_file }}"
+            timeout: 300
+          delegate_to: localhost
+
+        - name: Read worker join token
+          shell: cat {{ swarm_worker_token_file }}
+          delegate_to: localhost
+          register: worker_token
+          changed_when: false
+
+        - name: Get manager node IP
+          set_fact:
+            manager_ip: "{{ hostvars[groups['master'][0]]['ansible_default_ipv4']['address'] }}"
+
+        - name: Join Swarm as worker
+          shell: docker swarm join --token {{ worker_token.stdout }} {{ manager_ip }}:2377
+          register: join_result
+
+        - name: Verify node joined
+          shell: sleep 5 && docker node ls
+          environment:
+            DOCKER_HOST: "unix:///var/run/docker.sock"
+          delegate_to: "{{ groups['master'][0] }}"
+          changed_when: false
+
+      when: "'Swarm: active' not in node_swarm_status.stdout"
+
+  # Final Status
+- hosts: master
+  gather_facts: yes
+
+  tasks:
+    - name: Display Swarm status
+      shell: |
+        docker node ls
+        echo ""
+        echo "Swarm initialized successfully!"
+        echo "Manager node: {{ inventory_hostname }}"
+        echo "Worker nodes: {{ groups['worker'] | join(', ') if groups['worker'] is defined else 'none' }}"
+        echo ""
+        echo "Useful commands:"
+        echo "  docker node ls                    - List all nodes"
+        echo "  docker service ls                 - List services"
+        echo "  docker service create --name web --replicas 3 nginx - Create service"
+        echo "  docker service logs <service>     - View service logs"
+        echo "  docker service update --replicas 5 <service> - Scale service"
+      register: swarm_status
+
+    - name: Swarm setup complete
+      debug:
+        msg: "{{ swarm_status.stdout_lines }}"

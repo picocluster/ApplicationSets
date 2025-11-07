@@ -1,0 +1,119 @@
+---
+# Install Docker and Docker Compose on RPI5 Ubuntu nodes
+# Usage: ansible-playbook install_docker_ubuntu.ansible
+
+- hosts: cluster
+  gather_facts: yes
+  become: yes
+
+  vars:
+    docker_version: "latest"
+    docker_compose_version: "latest"
+
+  tasks:
+    - name: Update package manager cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required system packages
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - software-properties-common
+          - net-tools
+          - vim
+        state: present
+
+    - name: Check if Docker is already installed
+      shell: which docker
+      ignore_errors: yes
+      register: docker_check
+
+    - name: Install Docker on RPI5 Ubuntu
+      block:
+        - name: Add Docker's official GPG key
+          shell: curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+
+        - name: Add Docker repository for Ubuntu ARM64
+          lineinfile:
+            path: /etc/apt/sources.list.d/docker.list
+            line: "deb [arch=arm64 signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+            create: yes
+
+        - name: Update package cache
+          apt:
+            update_cache: yes
+
+        - name: Install Docker
+          apt:
+            name:
+              - docker-ce
+              - docker-ce-cli
+              - containerd.io
+            state: present
+
+        - name: Enable Docker service
+          systemd:
+            name: docker
+            enabled: yes
+            state: started
+
+      when: docker_check is failed
+
+    - name: Add pi user to docker group
+      user:
+        name: pi
+        groups: docker
+        append: yes
+
+    - name: Check if Docker Compose is already installed
+      shell: which docker-compose
+      ignore_errors: yes
+      register: docker_compose_check
+
+    - name: Install Docker Compose
+      block:
+        - name: Get latest Docker Compose version
+          shell: curl -s https://api.github.com/repos/docker/compose/releases/latest | grep 'tag_name' | cut -d'"' -f4
+          register: compose_version
+          when: docker_compose_version == "latest"
+
+        - name: Download and install Docker Compose for ARM64
+          shell: |
+            curl -L "https://github.com/docker/compose/releases/download/{{ compose_version.stdout | default('v2.20.0') }}/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+            chmod +x /usr/local/bin/docker-compose
+          when: docker_compose_version == "latest"
+
+        - name: Create symlink for docker-compose
+          shell: ln -sf /usr/local/bin/docker-compose /usr/bin/docker-compose
+          ignore_errors: yes
+
+      when: docker_compose_check is failed
+
+    - name: Verify Docker installation
+      shell: docker --version && docker-compose --version
+      register: docker_version_output
+
+    - name: Display Docker installation status
+      debug:
+        msg: |
+          ====== Docker Installation Complete (RPI5 Ubuntu) ======
+
+          {{ docker_version_output.stdout }}
+
+          Docker service status:
+          Active: {{ ansible_facts.services['docker.service'].state | default('unknown') }}
+
+          To verify on this node:
+            docker ps
+            docker images
+            docker-compose --version
+
+          To test Docker:
+            docker run --rm arm64v8/alpine echo "Hello from Docker!"
+
+          Next: Set up Docker Swarm with setup_docker_swarm_ubuntu.ansible
