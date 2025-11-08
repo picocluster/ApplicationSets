@@ -1,0 +1,135 @@
+---
+# Install LXD (system containers) on Odroid H4 and other Intel systems
+# LXD provides system containers - lighter than VMs but more isolated than Docker
+# Usage: ansible-playbook install_lxd_single.ansible -l pc0
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    lxd_version: "latest"
+    storage_backend: "dir"  # or btrfs, lvm, zfs for better performance
+
+  tasks:
+    - name: Update package manager cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required packages for LXD
+      apt:
+        name:
+          - curl
+          - wget
+          - git
+          - vim
+          - net-tools
+          - bridge-utils
+          - dnsmasq-base
+        state: present
+
+    - name: Check if LXD is already installed
+      shell: which lxd
+      ignore_errors: yes
+      register: lxd_check
+
+    - name: Install LXD from snapcraft
+      block:
+        - name: Install snapd if not present
+          apt:
+            name: snapd
+            state: present
+
+        - name: Ensure snapd service is running
+          systemd:
+            name: snapd
+            enabled: yes
+            state: started
+
+        - name: Install LXD snap
+          shell: |
+            snap install lxd --classic
+          register: snap_install
+
+        - name: Wait for LXD to initialize
+          pause:
+            seconds: 5
+
+      when: lxd_check is failed
+
+    - name: Initialize LXD
+      block:
+        - name: Check if LXD is initialized
+          shell: lxc config show storage.source
+          ignore_errors: yes
+          register: lxd_init_check
+
+        - name: Configure LXD with preset
+          shell: |
+            lxd init --auto \
+              --network-address=0.0.0.0 \
+              --network-port=8443 \
+              --trust-password=changeme \
+              --storage-backend={{ storage_backend }}
+          when: lxd_init_check is failed
+          ignore_errors: yes
+
+      when: lxd_check is failed
+
+    - name: Add current user to lxd group
+      user:
+        name: "{{ ansible_user_id }}"
+        groups: lxd
+        append: yes
+
+    - name: Add picocluster to lxd group
+      user:
+        name: picocluster
+        groups: lxd
+        append: yes
+      ignore_errors: yes
+
+    - name: Create LXD network bridge
+      shell: |
+        lxc network show lxdbr0 > /dev/null 2>&1 || lxc network create lxdbr0 \
+          ipv4.address=10.200.0.1/24 \
+          ipv6.address=fd42:::::1/64 \
+          ipv4.nat=true \
+          ipv6.nat=true
+      ignore_errors: yes
+
+    - name: Set default LXD profile
+      shell: |
+        lxc profile device set default root size 20GB
+        lxc profile device set default eth0 network lxdbr0
+      ignore_errors: yes
+
+    - name: Verify LXD installation
+      shell: |
+        lxd --version
+        lxc list
+      register: lxd_status
+
+    - name: Display LXD setup complete
+      debug:
+        msg: |
+          ====== LXD Installation Complete ======
+
+          LXD Version:
+          {{ lxd_status.stdout_lines | first }}
+
+          Current Containers:
+          {{ lxd_status.stdout_lines | last }}
+
+          Quick Start Commands:
+            lxc list                    - List containers
+            lxc launch ubuntu:22.04 c1  - Launch container
+            lxc exec c1 bash            - Execute command
+            lxc delete c1 -f            - Delete container
+            lxc image list              - List available images
+            lxc profile list            - List profiles
+            lxc storage list            - List storage pools
+
+          Next: Configure LXD cluster with setup_lxd_cluster.ansible
+          Or: Start creating containers with lxc launch

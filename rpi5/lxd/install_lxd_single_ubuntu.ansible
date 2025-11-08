@@ -1,0 +1,162 @@
+---
+# Install LXD (system containers) on single RPI5 node (Ubuntu)
+# LXD provides lightweight VM and container management
+# Usage: ansible-playbook install_lxd_single_ubuntu.ansible -l pc0
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    lxd_package_version: "latest"
+
+  tasks:
+    - name: Update package manager cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - snapd
+          - curl
+          - wget
+          - vim
+          - net-tools
+          - jq
+        state: present
+
+    - name: Check if snap is available
+      shell: which snap
+      ignore_errors: yes
+      register: snap_check
+
+    - name: Enable snapd service
+      systemd:
+        name: snapd
+        enabled: yes
+        state: started
+      when: snap_check is succeeded
+
+    - name: Wait for snapd to initialize
+      pause:
+        seconds: 10
+
+    - name: Check if LXD is already installed
+      shell: which lxd
+      ignore_errors: yes
+      register: lxd_check
+
+    - name: Install LXD via snap
+      shell: snap install lxd
+      when: lxd_check is failed
+      register: lxd_install_result
+
+    - name: Add ubuntu user to lxd group
+      user:
+        name: ubuntu
+        groups: lxd
+        append: yes
+      ignore_errors: yes
+
+    - name: Add picocluster user to lxd group
+      user:
+        name: picocluster
+        groups: lxd
+        append: yes
+      ignore_errors: yes
+
+    - name: Initialize LXD
+      block:
+        - name: Check LXD initialization status
+          shell: lxc storage list 2>/dev/null | grep -q "local" || echo "not-initialized"
+          register: lxd_status
+          changed_when: false
+          ignore_errors: yes
+
+        - name: Initialize LXD with preseed
+          shell: |
+            lxd init --auto \
+              --storage-backend dir \
+              --network-address 0.0.0.0 \
+              --network-port 8443 \
+              --trust-password lxdcluster
+          when: "'not-initialized' in lxd_status.stdout"
+
+      when: lxd_install_result is changed or lxd_check is failed
+
+    - name: Create LXD directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /var/lib/lxd
+        - /var/lib/lxd/containers
+        - /var/lib/lxd/snapshots
+
+    - name: Enable LXD daemon
+      systemd:
+        name: snap.lxd.daemon
+        enabled: yes
+        state: started
+      ignore_errors: yes
+
+    - name: Wait for LXD to start
+      pause:
+        seconds: 5
+
+    - name: Verify LXD installation
+      shell: |
+        lxd --version
+        lxc version
+        lxc storage list
+      register: lxd_verify
+
+    - name: Display LXD setup complete
+      debug:
+        msg: |
+          ====== LXD Single-Node Installation Complete (RPI5 Ubuntu) ======
+
+          Version:
+          {{ lxd_verify.stdout_lines | first }}
+
+          Storage Backend: dir (filesystem-based)
+          Network Address: 0.0.0.0:8443
+
+          Default Images:
+          To list available images: lxc image list
+
+          Create and Launch a Container:
+            lxc launch ubuntu:22.04 my-container
+            lxc exec my-container -- bash
+
+          Useful Commands:
+            lxc list                     - List all containers
+            lxc info <container>         - Get container info
+            lxc start <container>        - Start container
+            lxc stop <container>         - Stop container
+            lxc delete <container>       - Delete container
+            lxc file push file.txt <container>/tmp/
+            lxc exec <container> -- command
+            lxc config show <container>  - Show container config
+            lxc storage list             - List storage pools
+
+          Network Commands:
+            lxc network list             - List networks
+            lxc network show lxdbr0      - Show bridge config
+
+          Image Management:
+            lxc image list               - List images
+            lxc image info ubuntu:22.04  - Get image info
+            lxc publish <container> --alias myimage
+
+          Create Container Example:
+            lxc launch ubuntu:22.04 web1
+            lxc exec web1 -- apt update
+            lxc exec web1 -- apt install -y nginx
+            lxc config device add web1 http proxy listen=tcp:0.0.0.0:8080 connect=tcp:127.0.0.1:80
+
+          Next: Set up LXD cluster with setup_lxd_cluster_ubuntu.ansible
+

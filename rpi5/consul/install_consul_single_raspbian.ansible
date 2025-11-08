@@ -1,0 +1,211 @@
+---
+# Install Consul (service discovery and key-value store) on single RPI5 node (Raspbian)
+# Consul provides service registry, configuration, and health checking
+# Usage: ansible-playbook install_consul_single_raspbian.ansible -l pc0
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    consul_version: "1.17.0"
+    consul_user: "consul"
+    consul_group: "consul"
+
+  tasks:
+    - name: Update package manager cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - curl
+          - wget
+          - unzip
+          - vim
+          - net-tools
+          - jq
+          - dnsmasq
+        state: present
+
+    - name: Create consul user and group
+      block:
+        - name: Create consul group
+          group:
+            name: "{{ consul_group }}"
+            state: present
+
+        - name: Create consul user
+          user:
+            name: "{{ consul_user }}"
+            group: "{{ consul_group }}"
+            home: /var/lib/consul
+            shell: /usr/sbin/nologin
+            createhome: no
+
+    - name: Check if Consul is already installed
+      shell: which consul
+      ignore_errors: yes
+      register: consul_check
+
+    - name: Download and install Consul
+      block:
+        - name: Download Consul for ARM64
+          shell: |
+            cd /tmp
+            wget -q https://releases.hashicorp.com/consul/{{ consul_version }}/consul_{{ consul_version }}_linux_arm64.zip
+          register: download_result
+
+        - name: Extract Consul
+          shell: |
+            cd /tmp
+            unzip -o consul_*.zip
+            sudo mv consul /usr/local/bin/
+            sudo chmod +x /usr/local/bin/consul
+            rm consul_*.zip
+
+        - name: Enable command completion
+          shell: |
+            consul -autocomplete-install || true
+
+      when: consul_check is failed
+
+    - name: Create Consul directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ consul_user }}"
+        group: "{{ consul_group }}"
+        mode: '0755'
+      loop:
+        - /etc/consul.d
+        - /var/lib/consul
+        - /var/log/consul
+
+    - name: Create Consul configuration
+      copy:
+        dest: /etc/consul.d/consul.hcl
+        content: |
+          # Consul configuration for single node (RPI5 Raspbian)
+
+          datacenter = "dc1"
+          node_name = "{{ inventory_hostname }}"
+          server = true
+          bootstrap_expect = 1
+          ui_config {
+            enabled = true
+          }
+          client_addr = "0.0.0.0"
+          bind_addr = "{{ ansible_default_ipv4.address }}"
+          advertise_addr = "{{ ansible_default_ipv4.address }}"
+          ports {
+            grpc = 8502
+          }
+          connect {
+            enabled = true
+          }
+        owner: "{{ consul_user }}"
+        group: "{{ consul_group }}"
+        mode: '0640'
+
+    - name: Create systemd service file
+      copy:
+        dest: /etc/systemd/system/consul.service
+        content: |
+          [Unit]
+          Description=Consul
+          Documentation=https://www.consul.io/docs
+          Requires=network-online.target
+          After=network-online.target
+          ConditionFileNotEmpty=/etc/consul.d/consul.hcl
+
+          [Service]
+          Type=notify
+          ProtectSystem=full
+          ProtectHome=yes
+          NoNewPrivileges=yes
+          SecureBits=keep-caps
+          AmbientCapabilities=CAP_NET_BIND_SERVICE
+          CapabilityBoundingSet=CAP_SYSLOG CAP_NET_BIND_SERVICE
+          LimitNOFILE=65536
+          LimitNPROC=infinity
+          KillMode=process
+          KillSignal=SIGINT
+          Restart=on-failure
+          RestartSec=5
+          TimeoutStopSec=30
+          StartLimitInterval=60
+          StartLimitBurst=3
+          ExecStart=/usr/local/bin/consul agent -config-dir=/etc/consul.d
+          ExecReload=/bin/kill -HUP $MAINPID
+          User={{ consul_user }}
+          Group={{ consul_group }}
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable and start Consul service
+      systemd:
+        name: consul
+        daemon_reload: yes
+        enabled: yes
+        state: started
+
+    - name: Wait for Consul to start
+      pause:
+        seconds: 5
+
+    - name: Verify Consul installation
+      shell: |
+        consul version
+        consul members
+      register: consul_verify
+
+    - name: Display Consul setup complete
+      debug:
+        msg: |
+          ====== Consul Single-Node Installation Complete (RPI5 Raspbian) ======
+
+          Version:
+          {{ consul_verify.stdout_lines | first }}
+
+          Members:
+          {{ consul_verify.stdout_lines[2:] | join('\n') }}
+
+          Web UI: http://{{ ansible_default_ipv4.address }}:8500
+          DNS: {{ ansible_default_ipv4.address }}:8600
+
+          Common Commands:
+            consul members                - List all members
+            consul info                   - View server info
+            consul services               - List all services
+            consul catalog services       - Catalog services
+            consul kv put key value       - Set key-value
+            consul kv get key             - Get key-value
+
+          Register a Service:
+            cat > /etc/consul.d/nginx.json << 'EOF'
+            {
+              "service": {
+                "name": "nginx",
+                "id": "nginx-01",
+                "port": 80,
+                "tags": ["web"],
+                "check": {
+                  "http": "http://localhost/health",
+                  "interval": "10s"
+                }
+              }
+            }
+            EOF
+
+            consul reload
+
+          Query Service:
+            consul catalog service nginx
+            dig @127.0.0.1 -p 8600 nginx.service.consul
+
+          Next: Set up Consul cluster with setup_consul_cluster_raspbian.ansible
+

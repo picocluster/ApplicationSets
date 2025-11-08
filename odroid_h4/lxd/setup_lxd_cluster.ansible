@@ -1,0 +1,126 @@
+---
+# Setup LXD Cluster - Convert single node to clustered LXD
+# LXD clustering allows containers to be distributed and migrated across nodes
+# Usage: ansible-playbook setup_lxd_cluster.ansible
+
+- hosts: cluster
+  gather_facts: yes
+  become: yes
+
+  vars:
+    cluster_name: "pico-cluster"
+    cluster_pass_file: "/tmp/lxd_cluster_token.txt"
+
+  pre_tasks:
+    - name: Validate cluster structure
+      assert:
+        that:
+          - groups['master'] is defined
+          - groups['master'] | length > 0
+        fail_msg: "Must define [master] group"
+
+  # Initialize cluster on manager
+- hosts: master
+  gather_facts: yes
+  become: yes
+
+  vars:
+    cluster_name: "pico-cluster"
+    cluster_pass_file: "/tmp/lxd_cluster_token.txt"
+
+  tasks:
+    - name: Check if LXD cluster is initialized
+      shell: lxc cluster list 2>/dev/null | head -1
+      ignore_errors: yes
+      register: cluster_check
+
+    - name: Initialize LXD cluster on manager
+      block:
+        - name: Create cluster configuration
+          shell: |
+            lxc config set core.https_address "[::]:8443"
+            lxc config set core.trust_password "{{ cluster_name }}-$(openssl rand -hex 16)"
+          register: cluster_config
+
+        - name: Enable clustering
+          shell: |
+            lxd init --auto \
+              --cluster-name={{ cluster_name }} \
+              --cluster-address="{{ ansible_default_ipv4.address }}:8443"
+          register: cluster_init
+          ignore_errors: yes
+
+        - name: Get cluster token
+          shell: |
+            lxc config get core.trust_password > {{ cluster_pass_file }}
+          delegate_to: localhost
+
+        - name: Display cluster initialized
+          debug:
+            msg: |
+              LXD Cluster initialized on {{ inventory_hostname }}
+              Cluster Name: {{ cluster_name }}
+              Manager IP: {{ ansible_default_ipv4.address }}
+
+      when: '"pico-cluster" not in cluster_check.stdout'
+
+  # Join worker nodes
+- hosts: worker
+  gather_facts: yes
+  become: yes
+
+  vars:
+    cluster_pass_file: "/tmp/lxd_cluster_token.txt"
+
+  tasks:
+    - name: Join LXD cluster
+      block:
+        - name: Wait for cluster token
+          wait_for:
+            path: "{{ cluster_pass_file }}"
+            timeout: 300
+          delegate_to: localhost
+
+        - name: Read cluster token
+          shell: cat {{ cluster_pass_file }}
+          delegate_to: localhost
+          register: cluster_token
+          changed_when: false
+
+        - name: Get manager node IP
+          set_fact:
+            manager_ip: "{{ hostvars[groups['master'][0]]['ansible_default_ipv4']['address'] }}"
+
+        - name: Join cluster
+          shell: |
+            lxd init --auto \
+              --cluster-join \
+              --cluster-address="{{ ansible_default_ipv4.address }}:8443" \
+              --cluster-server-address="{{ manager_ip }}:8443" \
+              --cluster-certificate="{{ cluster_token.stdout }}"
+          register: join_result
+          ignore_errors: yes
+
+      ignore_errors: yes
+
+  # Verify cluster
+- hosts: master
+  gather_facts: yes
+
+  tasks:
+    - name: Display cluster status
+      shell: |
+        echo "LXD Cluster Status:"
+        lxc cluster list
+        echo ""
+        echo "Member Nodes:"
+        lxc cluster list --format json | jq '.[] | {name, status, role}'
+        echo ""
+        echo "Storage Pools:"
+        lxc storage list
+      register: cluster_status
+      ignore_errors: yes
+
+    - name: Cluster setup complete
+      debug:
+        msg: "{{ cluster_status.stdout_lines }}"

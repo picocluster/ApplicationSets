@@ -1,0 +1,197 @@
+---
+# Setup Consul cluster on RPI5 Raspbian nodes
+# Converts initialized Consul servers into a cluster with replication
+# Usage: ansible-playbook setup_consul_cluster_raspbian.ansible
+
+- hosts: cluster
+  gather_facts: yes
+  become: yes
+
+  vars:
+    consul_version: "1.17.0"
+    consul_user: "consul"
+    consul_group: "consul"
+
+  pre_tasks:
+    - name: Validate master and worker groups exist
+      assert:
+        that:
+          - groups['master'] is defined
+          - groups['master'] | length > 0
+        fail_msg: "Must define [master] group in inventory"
+
+  # Configure cluster on manager node
+- hosts: master
+  gather_facts: yes
+  become: yes
+
+  vars:
+    consul_version: "1.17.0"
+    consul_user: "consul"
+    consul_group: "consul"
+
+  tasks:
+    - name: Get current server configuration
+      shell: consul members 2>/dev/null | head -3 || echo "not-running"
+      ignore_errors: yes
+      register: server_status
+      changed_when: false
+
+    - name: Configure Consul for clustering on manager
+      block:
+        - name: Create updated Consul cluster configuration
+          copy:
+            dest: /etc/consul.d/server.hcl
+            content: |
+              # Consul Server configuration for clustering (RPI5 Raspbian)
+
+              datacenter = "dc1"
+              node_name = "{{ inventory_hostname }}"
+              server = true
+              bootstrap_expect = {{ groups['cluster'] | length }}
+              ui_config {
+                enabled = true
+              }
+              client_addr = "0.0.0.0"
+              bind_addr = "{{ ansible_default_ipv4.address }}"
+              advertise_addr = "{{ ansible_default_ipv4.address }}"
+              retry_join = [
+                {% for host in groups['cluster'] %}
+                "{{ hostvars[host]['ansible_default_ipv4']['address'] }}"{{ "," if not loop.last else "" }}
+                {% endfor %}
+              ]
+              ports {
+                grpc = 8502
+              }
+              connect {
+                enabled = true
+              }
+              performance {
+                raft_multiplier = 1
+              }
+            owner: "{{ consul_user }}"
+            group: "{{ consul_group }}"
+            mode: '0640'
+
+        - name: Restart Consul service
+          systemd:
+            name: consul
+            daemon_reload: yes
+            state: restarted
+
+        - name: Wait for Consul to become leader
+          pause:
+            seconds: 10
+
+        - name: Display cluster bootstrap message
+          debug:
+            msg: |
+              Consul cluster bootstrap in progress on {{ inventory_hostname }} (Raspbian)
+              Master IP: {{ ansible_default_ipv4.address }}
+              Expected nodes: {{ groups['cluster'] | length }}
+
+      when: server_status.rc != 0 or "not-running" in server_status.stdout
+
+  # Join worker nodes to cluster
+- hosts: worker
+  gather_facts: yes
+  become: yes
+
+  vars:
+    consul_user: "consul"
+    consul_group: "consul"
+
+  tasks:
+    - name: Check if Consul is running as client
+      shell: consul members 2>/dev/null | grep -q "{{ inventory_hostname }}" && echo "joined" || echo "not-joined"
+      ignore_errors: yes
+      register: consul_client_status
+      changed_when: false
+
+    - name: Configure Consul as worker/client node
+      block:
+        - name: Create Consul client configuration
+          copy:
+            dest: /etc/consul.d/client.hcl
+            content: |
+              # Consul Client configuration (RPI5 Raspbian)
+
+              datacenter = "dc1"
+              node_name = "{{ inventory_hostname }}"
+              server = false
+              ui_config {
+                enabled = true
+              }
+              client_addr = "0.0.0.0"
+              bind_addr = "{{ ansible_default_ipv4.address }}"
+              advertise_addr = "{{ ansible_default_ipv4.address }}"
+              retry_join = [
+                {% for host in groups['master'] %}
+                "{{ hostvars[host]['ansible_default_ipv4']['address'] }}"{{ "," if not loop.last else "" }}
+                {% endfor %}
+              ]
+              ports {
+                grpc = 8502
+              }
+              connect {
+                enabled = true
+              }
+            owner: "{{ consul_user }}"
+            group: "{{ consul_group }}"
+            mode: '0640'
+
+        - name: Restart Consul service on worker
+          systemd:
+            name: consul
+            daemon_reload: yes
+            state: restarted
+
+        - name: Wait for Consul client to register
+          pause:
+            seconds: 5
+
+      when: "'not-joined' in consul_client_status.stdout"
+
+  # Display cluster status
+- hosts: master
+  gather_facts: yes
+
+  tasks:
+    - name: Display Consul cluster status
+      shell: |
+        echo "=== Cluster Members ==="
+        consul members
+        echo ""
+        echo "=== Cluster Status ==="
+        consul info | grep -A 5 "raft:"
+      register: consul_cluster_status
+      ignore_errors: yes
+
+    - name: Display cluster info
+      debug:
+        msg: |
+          ====== Consul Cluster Setup Complete (RPI5 Raspbian) ======
+
+          {{ consul_cluster_status.stdout }}
+
+          Master node: {{ inventory_hostname }}
+          Worker nodes: {{ groups['worker'] | join(', ') if groups['worker'] is defined else 'none' }}
+
+          Web UI: http://{{ ansible_default_ipv4.address }}:8500
+          DNS: {{ ansible_default_ipv4.address }}:8600
+
+          Common Cluster Commands:
+            consul members                     - Show cluster members
+            consul operator raft list-peers    - Show Raft peers
+            consul monitor                     - Stream logs
+            consul debug                       - Collect debug info
+
+          Service Discovery:
+            consul catalog services            - List all services
+            consul catalog nodes               - List all nodes
+            consul kv get <path>               - Get value from KV store
+            consul kv put <key> <value>        - Set KV value
+
+          View cluster metrics:
+            http://{{ ansible_default_ipv4.address }}:8500
+

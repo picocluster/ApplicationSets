@@ -1,0 +1,235 @@
+---
+# Install Nomad (multi-workload orchestrator) on single RPI5 node (Ubuntu)
+# Nomad can orchestrate Docker, raw binaries, Java, and more
+# Usage: ansible-playbook install_nomad_single_ubuntu.ansible -l pc0
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    nomad_version: "1.7.0"
+    nomad_user: "nomad"
+    nomad_group: "nomad"
+
+  tasks:
+    - name: Update package manager cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - curl
+          - wget
+          - unzip
+          - vim
+          - net-tools
+          - jq
+        state: present
+
+    - name: Create nomad user and group
+      block:
+        - name: Create nomad group
+          group:
+            name: "{{ nomad_group }}"
+            state: present
+
+        - name: Create nomad user
+          user:
+            name: "{{ nomad_user }}"
+            group: "{{ nomad_group }}"
+            home: /var/lib/nomad
+            shell: /usr/sbin/nologin
+            createhome: no
+
+    - name: Check if Nomad is already installed
+      shell: which nomad
+      ignore_errors: yes
+      register: nomad_check
+
+    - name: Download and install Nomad
+      block:
+        - name: Download Nomad for ARM64
+          shell: |\
+            cd /tmp
+            wget -q https://releases.hashicorp.com/nomad/{{ nomad_version }}/nomad_{{ nomad_version }}_linux_arm64.zip
+          register: download_result
+
+        - name: Extract Nomad
+          shell: |\
+            cd /tmp
+            unzip -o nomad_*.zip
+            sudo mv nomad /usr/local/bin/
+            sudo chmod +x /usr/local/bin/nomad
+            rm nomad_*.zip
+
+        - name: Enable command completion
+          shell: |\
+            nomad -autocomplete-install || true
+
+      when: nomad_check is failed
+
+    - name: Create Nomad directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ nomad_user }}"
+        group: "{{ nomad_group }}"
+        mode: '0755'
+      loop:
+        - /etc/nomad.d
+        - /var/lib/nomad
+        - /var/log/nomad
+
+    - name: Create Nomad configuration
+      copy:
+        dest: /etc/nomad.d/nomad.hcl
+        content: |
+          # Nomad configuration for single node (RPI5 Ubuntu)
+
+          datacenter = "dc1"
+          region = "global"
+          node_name = "{{ inventory_hostname }}"
+          data_dir = "/var/lib/nomad"
+
+          # Server configuration
+          server {
+            enabled = true
+            bootstrap_expect = 1
+          }
+
+          # Client configuration
+          client {
+            enabled = true
+            servers = ["127.0.0.1:4647"]
+          }
+
+          # UI
+          ui {
+            enabled = true
+          }
+
+          # Telemetry
+          telemetry {
+            prometheus_metrics = true
+            publish_allocation_metrics = true
+          }
+
+          # API configuration
+          bind_addr = "0.0.0.0"
+        owner: "{{ nomad_user }}"
+        group: "{{ nomad_group }}"
+        mode: '0640'
+
+    - name: Create systemd service file
+      copy:
+        dest: /etc/systemd/system/nomad.service
+        content: |
+          [Unit]
+          Description=Nomad
+          Documentation=https://www.nomadproject.io/docs
+          Requires=network-online.target
+          After=network-online.target
+          ConditionFileNotEmpty=/etc/nomad.d/nomad.hcl
+
+          [Service]
+          Type=notify
+          ProtectSystem=full
+          ProtectHome=yes
+          NoNewPrivileges=yes
+          SecureBits=keep-caps
+          AmbientCapabilities=CAP_SYS_CHROOT
+          Capabilities=CAP_SYS_CHROOT+ep
+          CapabilityBoundingSet=CAP_SYSLOG CAP_SYS_CHROOT
+          LimitNOFILE=65536
+          LimitNPROC=infinity
+          KillMode=process
+          KillSignal=SIGINT
+          Restart=on-failure
+          RestartSec=5
+          TimeoutStopSec=30
+          StartLimitInterval=60
+          StartLimitBurst=3
+          ExecStart=/usr/local/bin/nomad agent -config=/etc/nomad.d
+          ExecReload=/bin/kill -HUP $MAINPID
+          User={{ nomad_user }}
+          Group={{ nomad_group }}
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Enable and start Nomad service
+      systemd:
+        name: nomad
+        daemon_reload: yes
+        enabled: yes
+        state: started
+
+    - name: Wait for Nomad to start
+      pause:
+        seconds: 5
+
+    - name: Verify Nomad installation
+      shell: |
+        nomad version
+        nomad status
+        nomad node status
+      register: nomad_verify
+
+    - name: Display Nomad setup complete
+      debug:
+        msg: |
+          ====== Nomad Single-Node Installation Complete (RPI5 Ubuntu) ======
+
+          Version:
+          {{ nomad_verify.stdout_lines | first }}
+
+          Nomad Status:
+          {{ nomad_verify.stdout_lines | last }}
+
+          Web UI: http://{{ ansible_default_ipv4.address }}:4646
+          RPC Address: {{ ansible_default_ipv4.address }}:4647
+
+          Common Commands:
+            nomad status                  - View cluster status
+            nomad node status             - View node status
+            nomad job run job.nomad       - Submit a job
+            nomad job status <job>        - View job status
+            nomad alloc logs <alloc-id>   - View allocation logs
+
+          Create a job file and deploy it:
+            cat > my-job.nomad << 'EOF'
+            job "my-app" {
+              datacenters = ["dc1"]
+              type = "service"
+              group "app" {
+                count = 1
+                task "app" {
+                  driver = "docker"
+                  config {
+                    image = "nginx:latest"
+                    ports = ["http"]
+                  }
+                  resources {
+                    cpu = 250
+                    memory = 256
+                  }
+                  service {
+                    name = "my-app"
+                    port = "http"
+                  }
+                }
+                network {
+                  mode = "bridge"
+                  port "http" {}
+                }
+              }
+            }
+            EOF
+
+            nomad run my-job.nomad
+
+          Next: Set up Nomad cluster with setup_nomad_cluster_ubuntu.ansible
+

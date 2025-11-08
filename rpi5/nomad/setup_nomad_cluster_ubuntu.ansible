@@ -1,0 +1,228 @@
+---
+# Setup Nomad cluster on RPI5 Ubuntu nodes
+# Converts initialized Nomad servers into a cluster
+# Usage: ansible-playbook setup_nomad_cluster_ubuntu.ansible
+
+- hosts: cluster
+  gather_facts: yes
+  become: yes
+
+  vars:
+    nomad_version: "1.7.0"
+    nomad_user: "nomad"
+    nomad_group: "nomad"
+
+  pre_tasks:
+    - name: Validate master and worker groups exist
+      assert:
+        that:
+          - groups['master'] is defined
+          - groups['master'] | length > 0
+        fail_msg: "Must define [master] group in inventory"
+
+  # Configure cluster on manager node
+- hosts: master
+  gather_facts: yes
+  become: yes
+
+  vars:
+    nomad_version: "1.7.0"
+    nomad_user: "nomad"
+    nomad_group: "nomad"
+
+  tasks:
+    - name: Get current server configuration
+      shell: nomad server members 2>/dev/null || echo "not-running"
+      ignore_errors: yes
+      register: server_status
+      changed_when: false
+
+    - name: Configure Nomad for clustering on manager
+      block:
+        - name: Create updated Nomad cluster configuration
+          copy:
+            dest: /etc/nomad.d/server.hcl
+            content: |
+              # Nomad Server configuration for clustering (RPI5 Ubuntu)
+
+              datacenter = "dc1"
+              region = "global"
+              node_name = "{{ inventory_hostname }}"
+              data_dir = "/var/lib/nomad"
+
+              # Server configuration - cluster mode
+              server {
+                enabled = true
+                bootstrap_expect = {{ groups['cluster'] | length }}
+                server_join {
+                  retry_join = [
+                    {% for host in groups['cluster'] %}
+                    "{{ hostvars[host]['ansible_default_ipv4']['address'] }}"{{ "," if not loop.last else "" }}
+                    {% endfor %}
+                  ]
+                }
+              }
+
+              # Client configuration
+              client {
+                enabled = true
+                servers = [
+                  {% for host in groups['master'] %}
+                  "{{ hostvars[host]['ansible_default_ipv4']['address'] }}:4647"{{ "," if not loop.last else "" }}
+                  {% endfor %}
+                ]
+              }
+
+              # Bind addresses
+              bind_addr = "{{ ansible_default_ipv4.address }}"
+              advertise {
+                http = "{{ ansible_default_ipv4.address }}"
+                rpc = "{{ ansible_default_ipv4.address }}"
+                serf = "{{ ansible_default_ipv4.address }}"
+              }
+
+              # Enable clustering
+              telemetry {
+                prometheus_metrics = true
+                publish_allocation_metrics = true
+              }
+
+              # UI
+              ui {
+                enabled = true
+              }
+            owner: "{{ nomad_user }}"
+            group: "{{ nomad_group }}"
+            mode: '0640'
+
+        - name: Restart Nomad service
+          systemd:
+            name: nomad
+            daemon_reload: yes
+            state: restarted
+
+        - name: Wait for Nomad to become leader
+          pause:
+            seconds: 10
+
+        - name: Display cluster bootstrap message
+          debug:
+            msg: |
+              Nomad cluster bootstrap in progress on {{ inventory_hostname }} (Ubuntu)
+              Master IP: {{ ansible_default_ipv4.address }}
+              Expected nodes: {{ groups['cluster'] | length }}
+
+      when: server_status.rc != 0
+
+  # Join worker nodes to cluster
+- hosts: worker
+  gather_facts: yes
+  become: yes
+
+  vars:
+    nomad_version: "1.7.0"
+    nomad_user: "nomad"
+    nomad_group: "nomad"
+
+  tasks:
+    - name: Check if Nomad is running as client
+      shell: nomad node status 2>/dev/null | grep -q "ID" && echo "running" || echo "not-running"
+      ignore_errors: yes
+      register: nomad_client_status
+      changed_when: false
+
+    - name: Configure Nomad as worker node
+      block:
+        - name: Create Nomad worker configuration
+          copy:
+            dest: /etc/nomad.d/client.hcl
+            content: |
+              # Nomad Worker configuration (RPI5 Ubuntu)
+
+              datacenter = "dc1"
+              region = "global"
+              node_name = "{{ inventory_hostname }}"
+              data_dir = "/var/lib/nomad"
+
+              # Client configuration
+              client {
+                enabled = true
+                servers = [
+                  {% for host in groups['master'] %}
+                  "{{ hostvars[host]['ansible_default_ipv4']['address'] }}:4647"{{ "," if not loop.last else "" }}
+                  {% endfor %}
+                ]
+              }
+
+              # Bind addresses
+              bind_addr = "{{ ansible_default_ipv4.address }}"
+              advertise {
+                http = "{{ ansible_default_ipv4.address }}"
+                rpc = "{{ ansible_default_ipv4.address }}"
+                serf = "{{ ansible_default_ipv4.address }}"
+              }
+
+              # Enable telemetry
+              telemetry {
+                prometheus_metrics = true
+                publish_allocation_metrics = true
+              }
+            owner: "{{ nomad_user }}"
+            group: "{{ nomad_group }}"
+            mode: '0640'
+
+        - name: Restart Nomad service on worker
+          systemd:
+            name: nomad
+            daemon_reload: yes
+            state: restarted
+
+        - name: Wait for Nomad client to register
+          pause:
+            seconds: 5
+
+      when: nomad_client_status.rc != 0 or "not-running" in nomad_client_status.stdout
+
+  # Display cluster status
+- hosts: master
+  gather_facts: yes
+
+  tasks:
+    - name: Display Nomad cluster status
+      shell: |
+        nomad server members
+        echo ""
+        nomad node list
+        echo ""
+        nomad status
+      register: nomad_cluster_status
+      ignore_errors: yes
+
+    - name: Display cluster info
+      debug:
+        msg: |
+          ====== Nomad Cluster Setup Complete (RPI5 Ubuntu) ======
+
+          {{ nomad_cluster_status.stdout_lines | join('\n') }}
+
+          Master node: {{ inventory_hostname }}
+          Worker nodes: {{ groups['worker'] | join(', ') if groups['worker'] is defined else 'none' }}
+
+          Common Cluster Commands:
+            nomad server members               - Show server members
+            nomad node list                    - List all nodes
+            nomad node status <node-id>        - Check node status
+            nomad status                       - Check cluster status
+            nomad status <job>                 - Check job status
+            nomad alloc logs <alloc-id>        - View allocation logs
+            nomad node drain -self             - Drain current node
+
+          Deploy a job across cluster:
+            nomad job run job.nomad
+
+          Scale a job:
+            nomad job scale <job> <count>
+
+          View cluster metrics:
+            http://{{ ansible_default_ipv4.address }}:4646
+

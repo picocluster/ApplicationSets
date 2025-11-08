@@ -1,0 +1,124 @@
+---
+# Setup LXD cluster on Odroid C5 nodes (Debian-based)
+# Converts initialized LXD nodes into a cluster
+# Usage: ansible-playbook setup_lxd_cluster.ansible
+
+- hosts: cluster
+  gather_facts: yes
+  become: yes
+
+  vars:
+    cluster_token_file: "/tmp/lxd_cluster_token.txt"
+
+  pre_tasks:
+    - name: Validate master and worker groups exist
+      assert:
+        that:
+          - groups['master'] is defined
+          - groups['master'] | length > 0
+        fail_msg: "Must define [master] group in inventory"
+
+  # Initialize cluster on manager node
+- hosts: master
+  gather_facts: yes
+  become: yes
+
+  vars:
+    cluster_token_file: "/tmp/lxd_cluster_token.txt"
+
+  tasks:
+    - name: Check if LXD cluster is already initialized
+      shell: lxc cluster list 2>/dev/null | grep -q "{{ inventory_hostname }}" && echo "initialized" || echo "not-initialized"
+      register: cluster_status
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Initialize LXD cluster on manager
+      block:
+        - name: Generate cluster join token
+          shell: lxc cluster add "{{ inventory_hostname }}-cluster" --quiet
+          register: cluster_token_result
+          changed_when: true
+
+        - name: Save cluster token to file
+          copy:
+            content: "{{ cluster_token_result.stdout }}"
+            dest: "{{ cluster_token_file }}"
+            owner: root
+            group: root
+            mode: '0644'
+          delegate_to: localhost
+
+        - name: Display cluster initialized
+          debug:
+            msg: |
+              LXD Cluster initialized on {{ inventory_hostname }}
+              Manager IP: {{ ansible_default_ipv4.address }}
+              Join Token generated and saved to {{ cluster_token_file }}
+
+      when: "'not-initialized' in cluster_status.stdout or 'not-initialized' == cluster_status.stdout"
+
+  # Join worker nodes to cluster
+- hosts: worker
+  gather_facts: yes
+  become: yes
+
+  vars:
+    cluster_token_file: "/tmp/lxd_cluster_token.txt"
+
+  tasks:
+    - name: Check if node is already part of cluster
+      shell: lxc cluster list 2>/dev/null | grep -q "{{ inventory_hostname }}" && echo "joined" || echo "not-joined"
+      register: node_cluster_status
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Join worker nodes to cluster
+      block:
+        - name: Wait for cluster token file
+          wait_for:
+            path: "{{ cluster_token_file }}"
+            timeout: 300
+          delegate_to: localhost
+
+        - name: Read cluster join token
+          shell: cat {{ cluster_token_file }}
+          delegate_to: localhost
+          register: cluster_token
+          changed_when: false
+
+        - name: Join LXD cluster
+          shell: lxc cluster join "{{ cluster_token.stdout }}"
+          register: join_result
+
+        - name: Verify node joined
+          pause:
+            seconds: 5
+
+      when: "'not-joined' in node_cluster_status.stdout"
+
+  # Display cluster status
+- hosts: master
+  gather_facts: yes
+  become: yes
+
+  tasks:
+    - name: Display cluster status
+      shell: |
+        lxc cluster list
+        echo ""
+        echo "LXD Cluster setup complete (Odroid C5)!"
+        echo "Manager node: {{ inventory_hostname }}"
+        echo "Worker nodes: {{ groups['worker'] | join(', ') if groups['worker'] is defined else 'none' }}"
+        echo ""
+        echo "Cluster commands:"
+        echo "  lxc cluster list                  - List cluster members"
+        echo "  lxc cluster info <node>           - Get node info"
+        echo "  lxc cluster remove <node>         - Remove node from cluster"
+        echo "  lxc list -c n,s,ip4 --all-projects - List containers across cluster"
+      register: cluster_status_output
+
+    - name: Display cluster info
+      debug:
+        msg: "{{ cluster_status_output.stdout_lines }}"
+
