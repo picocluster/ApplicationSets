@@ -1,0 +1,191 @@
+---
+# Install Harbor (private container registry) on single Odroid H4 node
+# Harbor provides image registry, scanning, replication, and RBAC
+# Usage: ansible-playbook install_harbor_single.ansible -l pc0
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    harbor_version: "2.9.0"
+    harbor_hostname: "registry.local"
+    harbor_admin_password: "Harbor12345"
+
+  tasks:
+    - name: Update package manager cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - docker.io
+          - docker-compose
+          - curl
+          - wget
+          - openssl
+          - vim
+          - net-tools
+        state: present
+
+    - name: Ensure Docker service is running
+      systemd:
+        name: docker
+        enabled: yes
+        state: started
+
+    - name: Create Harbor directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /opt/harbor
+        - /data/harbor
+
+    - name: Download Harbor offline installer
+      shell: |
+        cd /opt/harbor
+        wget -q https://github.com/goharbor/harbor/releases/download/v{{ harbor_version }}/harbor-offline-installer-v{{ harbor_version }}.tgz
+        tar xzf harbor-offline-installer-v{{ harbor_version }}.tgz
+      args:
+        creates: /opt/harbor/harbor/harbor-core
+
+    - name: Generate self-signed certificate
+      block:
+        - name: Create certificate directory
+          file:
+            path: /data/harbor/certs
+            state: directory
+            mode: '0755'
+
+        - name: Generate private key
+          shell: |
+            openssl genrsa -out /data/harbor/certs/ca.key 4096
+          args:
+            creates: /data/harbor/certs/ca.key
+
+        - name: Generate certificate
+          shell: |
+            openssl req -new -x509 -days 365 -key /data/harbor/certs/ca.key \
+              -out /data/harbor/certs/ca.crt \
+              -subj "/CN={{ harbor_hostname }}"
+          args:
+            creates: /data/harbor/certs/ca.crt
+
+    - name: Configure Harbor
+      copy:
+        dest: /opt/harbor/harbor/harbor.yml
+        content: |
+          # Harbor Configuration
+
+          hostname: {{ harbor_hostname }}
+          http:
+            port: 80
+          https:
+            port: 443
+            certificate: /data/harbor/certs/ca.crt
+            private_key: /data/harbor/certs/ca.key
+
+          harbor_admin_password: {{ harbor_admin_password }}
+          database:
+            password: {{ harbor_admin_password }}
+          data_volume: /data/harbor
+
+          trivy:
+            ignore_unfixed: false
+            severity: HIGH,CRITICAL
+            skip_update: false
+
+          log:
+            level: info
+            local:
+              rotate_count: 50
+              rotate_size: 200M
+
+          _version: 2.0.0
+
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Install Harbor
+      shell: |
+        cd /opt/harbor/harbor
+        ./install.sh --with-trivy
+      environment:
+        DOCKER_CLI_HINTS: "false"
+      register: harbor_install
+      changed_when: "'Harbor has been installed' in harbor_install.stdout"
+
+    - name: Wait for Harbor to start
+      pause:
+        seconds: 15
+
+    - name: Verify Harbor installation
+      shell: |
+        curl -s -k https://{{ harbor_hostname }}/api/v2.0/systeminfo -u admin:{{ harbor_admin_password }} | head -20 || \
+        curl -s http://localhost/api/v2.0/systeminfo -u admin:{{ harbor_admin_password }} | head -20
+      register: harbor_verify
+      ignore_errors: yes
+
+    - name: Display Harbor setup complete
+      debug:
+        msg: |
+          ====== Harbor Private Registry Installation Complete (Odroid H4) ======
+
+          Harbor UI Access:
+          - URL: https://{{ harbor_hostname }}
+          - Admin User: admin
+          - Password: {{ harbor_admin_password }}
+
+          Docker Login:
+            docker login https://{{ harbor_hostname }}
+            # Username: admin
+            # Password: {{ harbor_admin_password }}
+
+          Push Image to Harbor:
+            1. Tag image:
+               docker tag myimage:latest {{ harbor_hostname }}/library/myimage:latest
+
+            2. Push image:
+               docker push {{ harbor_hostname }}/library/myimage:latest
+
+            3. Pull image:
+               docker pull {{ harbor_hostname }}/library/myimage:latest
+
+          Create Project:
+            docker run -it --rm curlimages/curl:latest curl -X POST \
+              -u admin:{{ harbor_admin_password }} \
+              -H "Content-Type: application/json" \
+              -d '{"project_name":"myproject","public":false}' \
+              https://{{ harbor_hostname }}/api/v2.0/projects
+
+          Harbor Features:
+            - Image Vulnerability Scanning with Trivy
+            - Image Signing and Verification
+            - Replication to multiple registries
+            - RBAC and webhook support
+            - Image retention policies
+
+          Common Commands:
+            docker login {{ harbor_hostname }}                # Login to Harbor
+            docker logout {{ harbor_hostname }}               # Logout
+            docker push {{ harbor_hostname }}/project/image   # Push image
+            docker pull {{ harbor_hostname }}/project/image   # Pull image
+
+          To add {{ harbor_hostname }} to /etc/hosts on client machines:
+            echo "{{ ansible_default_ipv4.address }} {{ harbor_hostname }}" | sudo tee -a /etc/hosts
+
+          View logs:
+            cd /opt/harbor/harbor
+            docker-compose logs -f
+
+          Stop Harbor:
+            cd /opt/harbor/harbor
+            docker-compose down
+
+          Next: Configure replication and projects in Harbor web UI
+

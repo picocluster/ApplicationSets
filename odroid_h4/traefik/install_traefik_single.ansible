@@ -1,0 +1,271 @@
+---
+# Install Traefik (load balancer and reverse proxy) on single Odroid H4 node
+# Traefik automatically discovers services and manages routing and load balancing
+# Usage: ansible-playbook install_traefik_single.ansible -l pc0
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    traefik_version: "3.0.0"
+    traefik_dashboard_user: "admin"
+    traefik_dashboard_password: "admin123"
+
+  tasks:
+    - name: Update package manager cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - docker.io
+          - docker-compose
+          - curl
+          - wget
+          - vim
+          - net-tools
+          - apache2-utils
+        state: present
+
+    - name: Ensure Docker service is running
+      systemd:
+        name: docker
+        enabled: yes
+        state: started
+
+    - name: Create Traefik directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /opt/traefik
+        - /opt/traefik/config
+        - /opt/traefik/acme
+        - /var/log/traefik
+
+    - name: Generate dashboard credentials
+      shell: |
+        echo -n "{{ traefik_dashboard_user }}:$(openssl passwd -apr1 '{{ traefik_dashboard_password }}')" > /opt/traefik/.htpasswd
+      args:
+        creates: /opt/traefik/.htpasswd
+
+    - name: Create Traefik configuration
+      copy:
+        dest: /opt/traefik/traefik.yml
+        content: |
+          # Traefik Configuration
+
+          global:
+            checkNewVersion: true
+            sendAnonymousUsage: false
+
+          entryPoints:
+            web:
+              address: ":80"
+            websecure:
+              address: ":443"
+            api:
+              address: ":8081"
+
+          log:
+            level: INFO
+            filePath: /var/log/traefik/traefik.log
+
+          accessLog:
+            filePath: /var/log/traefik/access.log
+
+          api:
+            dashboard: true
+            debug: false
+
+          providers:
+            docker:
+              endpoint: "unix:///var/run/docker.sock"
+              exposedByDefault: false
+            file:
+              filename: /opt/traefik/config/dynamic.yml
+              watch: true
+
+          certificatesResolvers:
+            letsencrypt:
+              acme:
+                email: admin@local
+                storage: /opt/traefik/acme/acme.json
+                httpChallenge:
+                  entryPoint: web
+
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Create dynamic configuration
+      copy:
+        dest: /opt/traefik/config/dynamic.yml
+        content: |
+          # Dynamic Configuration for Traefik
+
+          http:
+            routers:
+              dashboard:
+                rule: "PathPrefix(`/dashboard`) || PathPrefix(`/api`)"
+                service: api@internal
+                entryPoints:
+                  - web
+                  - websecure
+                middlewares:
+                  - auth
+
+            middlewares:
+              auth:
+                basicAuth:
+                  usersFile: /opt/traefik/.htpasswd
+
+          tcp:
+            # Add TCP routes here if needed
+
+          udp:
+            # Add UDP routes here if needed
+
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Create docker-compose.yml
+      copy:
+        dest: /opt/traefik/docker-compose.yml
+        content: |
+          version: '3'
+
+          services:
+            traefik:
+              image: traefik:{{ traefik_version }}
+              container_name: traefik
+              restart: unless-stopped
+              security_opt:
+                - no-new-privileges:true
+              networks:
+                - traefik
+              ports:
+                - 80:80
+                - 443:443
+                - 8081:8081
+              environment:
+                - CF_API_EMAIL=admin@local
+                - CF_API_KEY=
+              volumes:
+                - /etc/localtime:/etc/localtime:ro
+                - /var/run/docker.sock:/var/run/docker.sock:ro
+                - /opt/traefik/traefik.yml:/traefik.yml:ro
+                - /opt/traefik/config:/opt/traefik/config:ro
+                - /opt/traefik/acme:/opt/traefik/acme
+                - /opt/traefik/.htpasswd:/opt/traefik/.htpasswd:ro
+                - /var/log/traefik:/var/log/traefik
+              labels:
+                - "traefik.enable=true"
+                - "traefik.http.routers.dashboard.rule=PathPrefix(`/dashboard`) || PathPrefix(`/api`)"
+                - "traefik.http.routers.dashboard.service=api@internal"
+                - "traefik.http.routers.dashboard.entrypoints=web"
+
+          networks:
+            traefik:
+              driver: bridge
+
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Start Traefik
+      shell: |
+        cd /opt/traefik
+        docker-compose up -d
+      register: traefik_start
+      changed_when: "'Starting' in traefik_start.stdout or 'Creating' in traefik_start.stdout"
+
+    - name: Wait for Traefik to start
+      pause:
+        seconds: 10
+
+    - name: Verify Traefik installation
+      shell: |
+        curl -s http://localhost:8081/ping
+      register: traefik_verify
+      ignore_errors: yes
+
+    - name: Display Traefik setup complete
+      debug:
+        msg: |
+          ====== Traefik Load Balancer Installation Complete (Odroid H4) ======
+
+          Dashboard Access:
+          - URL: http://{{ ansible_default_ipv4.address }}:8081/dashboard/
+          - Username: {{ traefik_dashboard_user }}
+          - Password: {{ traefik_dashboard_password }}
+
+          API Endpoint: http://{{ ansible_default_ipv4.address }}:8081/api
+
+          Example Docker Compose Service with Traefik:
+            version: '3'
+            services:
+              nginx:
+                image: nginx:latest
+                container_name: nginx
+                restart: unless-stopped
+                networks:
+                  - traefik
+                labels:
+                  - "traefik.enable=true"
+                  - "traefik.http.routers.nginx.rule=Host(`nginx.local`)"
+                  - "traefik.http.services.nginx.loadbalancer.server.port=80"
+                  - "traefik.http.routers.nginx.entrypoints=web"
+
+            networks:
+              traefik:
+                external: true
+
+          Add to /etc/hosts on clients:
+            {{ ansible_default_ipv4.address }} nginx.local
+
+          Common Tasks:
+            1. Access Traefik:
+               http://{{ ansible_default_ipv4.address }}:8081/dashboard/
+
+            2. Test routing:
+               curl -H "Host: nginx.local" http://localhost
+
+            3. View logs:
+               cd /opt/traefik && docker-compose logs -f traefik
+
+            4. Restart Traefik:
+               cd /opt/traefik && docker-compose restart traefik
+
+          Enable HTTPS with Let's Encrypt:
+            1. Edit traefik.yml and uncomment certificatesResolvers
+            2. Update entryPoint.websecure with tls.certResolver: letsencrypt
+            3. Restart: docker-compose down && docker-compose up -d
+
+          Integrate with Docker Swarm or Kubernetes:
+            - For Swarm: Configure provider.swarm
+            - For Kubernetes: Configure provider.kubernetesIngress
+
+          Traefik Features:
+            - Automatic service discovery via Docker labels
+            - Load balancing and traffic management
+            - HTTPS/TLS termination
+            - Basic Auth, Digest Auth, CORS middleware
+            - Request retry and timeouts
+            - Circuit breaker support
+            - Rate limiting and compression
+
+          View Configuration:
+            curl -s http://{{ ansible_default_ipv4.address }}:8081/api/config
+
+          Monitor Metrics:
+            - Health checks at /ping
+            - Metrics available at /api
+
+          Next: Configure services with Traefik labels in docker-compose
+
