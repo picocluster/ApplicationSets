@@ -1,0 +1,391 @@
+---
+# Install container metrics collectors for Docker/Containerd/Kubernetes
+# Automatically detects which container runtime is installed and configures appropriate metrics
+#
+# Supports:
+# - Docker (with Docker metrics via socket)
+# - Containerd (with cAdvisor for container metrics)
+# - Kubernetes/K3s (with kube-state-metrics and kubelet metrics)
+#
+# Usage:
+#   Single node: ansible-playbook monitoring/metrics_collection/install_container_metrics.ansible -l pc0
+#   All nodes:   ansible-playbook monitoring/metrics_collection/install_container_metrics.ansible
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    cadvisor_version: "v0.45.0"
+    cadvisor_port: 8080
+    # Kubernetes settings (if K3s/K8s installed)
+    kubelet_metrics_port: 10250
+
+  pre_tasks:
+    - name: Display container metrics setup information
+      debug:
+        msg: |
+          ====== Container Metrics Collection Setup ======
+
+          Node: {{ ansible_hostname }}
+          Checking for installed container runtimes...
+
+          This script will:
+          1. Detect Docker, Containerd, and/or Kubernetes
+          2. Configure appropriate metrics collectors
+          3. Expose metrics for Prometheus scraping
+
+          =============================================
+
+    - name: Check for Docker installation
+      shell: which docker
+      ignore_errors: yes
+      register: docker_check
+      changed_when: false
+
+    - name: Check for Containerd installation
+      shell: which containerd
+      ignore_errors: yes
+      register: containerd_check
+      changed_when: false
+
+    - name: Check for Kubernetes/K3s installation
+      shell: which kubectl
+      ignore_errors: yes
+      register: kubectl_check
+      changed_when: false
+
+    - name: Check for kubelet (Kubernetes)
+      shell: which kubelet
+      ignore_errors: yes
+      register: kubelet_check
+      changed_when: false
+
+  tasks:
+    # ==================== Docker Metrics Configuration ====================
+
+    - name: Configure Docker metrics collection
+      block:
+        - name: Display Docker metrics configuration
+          debug:
+            msg: |
+              Docker detected on {{ ansible_hostname }}
+              Configuring Docker metrics on port 2375 (TCP)
+
+        - name: Create Docker daemon configuration directory
+          file:
+            path: /etc/docker
+            state: directory
+            mode: '0755'
+
+        - name: Configure Docker metrics (if not already configured)
+          copy:
+            content: |
+              {
+                "debug": false,
+                "hosts": ["unix:///var/run/docker.sock", "tcp://127.0.0.1:2375"],
+                "metrics-addr": "127.0.0.1:9323",
+                "experimental": false,
+                "log-driver": "json-file",
+                "log-opts": {
+                  "max-size": "10m",
+                  "max-file": "3"
+                }
+              }
+            dest: /etc/docker/daemon.json
+            mode: '0644'
+          register: docker_config
+
+        - name: Restart Docker to apply metrics configuration
+          systemd:
+            name: docker
+            state: restarted
+          when: docker_config is changed
+
+        - name: Wait for Docker metrics to be available
+          uri:
+            url: "http://localhost:9323/metrics"
+            method: GET
+            status_code: 200
+          retries: 10
+          delay: 2
+          changed_when: false
+          ignore_errors: yes
+
+      when: docker_check is succeeded
+      ignore_errors: yes
+
+    # ==================== Containerd Metrics Configuration ====================
+
+    - name: Configure Containerd metrics collection
+      block:
+        - name: Display Containerd metrics configuration
+          debug:
+            msg: |
+              Containerd detected on {{ ansible_hostname }}
+              Installing cAdvisor for container metrics on port 8080
+
+        - name: Create cAdvisor user
+          user:
+            name: cadvisor
+            system: yes
+            shell: /bin/false
+            comment: "cAdvisor user"
+
+        - name: Determine system architecture
+          set_fact:
+            exporter_arch: "{% if ansible_architecture == 'x86_64' %}amd64{% elif ansible_architecture == 'aarch64' %}arm64{% else %}{{ ansible_architecture }}{% endif %}"
+
+        - name: Check if cAdvisor is already installed
+          shell: which cadvisor
+          ignore_errors: yes
+          register: cadvisor_check
+          changed_when: false
+
+        - name: Install cAdvisor
+          block:
+            - name: Download cAdvisor binary
+              get_url:
+                url: "https://github.com/google/cadvisor/releases/download/{{ cadvisor_version }}/cadvisor-{{ cadvisor_version }}.linux-{{ exporter_arch }}"
+                dest: "/usr/local/bin/cadvisor"
+                mode: '0755'
+                timeout: 60
+              register: cadvisor_download
+              ignore_errors: yes
+
+            - name: Verify cAdvisor installation
+              shell: cadvisor --version
+              changed_when: false
+              ignore_errors: yes
+
+          when: cadvisor_check is failed
+
+        - name: Create cAdvisor systemd service file
+          copy:
+            content: |
+              [Unit]
+              Description=Google cAdvisor - Container Metrics
+              Wants=network-online.target
+              After=network-online.target
+
+              [Service]
+              Type=simple
+              User=root
+              Group=root
+              ExecStart=/usr/local/bin/cadvisor \
+                --port={{ cadvisor_port }} \
+                --storage_duration=5m \
+                --disable_metrics=advtcp,cpu_topology,disk,diskio,hugetlb,memory_numa,percpu,pids,referenced_memory,resctrl,sysfs,thermal,udp
+
+              SyslogIdentifier=cadvisor
+              Restart=always
+              RestartSec=5
+
+              [Install]
+              WantedBy=multi-user.target
+            dest: /etc/systemd/system/cadvisor.service
+            owner: root
+            group: root
+            mode: '0644'
+          register: cadvisor_service
+
+        - name: Enable and start cAdvisor service
+          systemd:
+            daemon_reload: yes
+            name: cadvisor
+            enabled: yes
+            state: started
+          when: cadvisor_service is changed
+
+      when: containerd_check is succeeded
+      ignore_errors: yes
+
+    # ==================== Kubernetes Metrics Configuration ====================
+
+    - name: Configure Kubernetes metrics collection
+      block:
+        - name: Display Kubernetes metrics configuration
+          debug:
+            msg: |
+              Kubernetes/K3s detected on {{ ansible_hostname }}
+              Kubelet metrics will be collected on port {{ kubelet_metrics_port }}
+
+        - name: Check if kube-state-metrics is running
+          shell: kubectl get pods -n kube-system -o name | grep kube-state-metrics
+          ignore_errors: yes
+          register: kube_state_metrics_check
+          changed_when: false
+
+        - name: Create kube-state-metrics namespace
+          shell: |
+            kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+          ignore_errors: yes
+          changed_when: false
+
+        - name: Deploy kube-state-metrics
+          shell: |
+            kubectl apply -f - <<EOF
+            apiVersion: apps/v1
+            kind: Deployment
+            metadata:
+              name: kube-state-metrics
+              namespace: monitoring
+            spec:
+              replicas: 1
+              selector:
+                matchLabels:
+                  app: kube-state-metrics
+              template:
+                metadata:
+                  labels:
+                    app: kube-state-metrics
+                spec:
+                  serviceAccountName: kube-state-metrics
+                  containers:
+                  - name: kube-state-metrics
+                    image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.4.2
+                    ports:
+                    - containerPort: 8080
+                    resources:
+                      limits:
+                        cpu: 100m
+                        memory: 256Mi
+                      requests:
+                        cpu: 10m
+                        memory: 32Mi
+            ---
+            apiVersion: v1
+            kind: ServiceAccount
+            metadata:
+              name: kube-state-metrics
+              namespace: monitoring
+            ---
+            apiVersion: rbac.authorization.k8s.io/v1
+            kind: ClusterRole
+            metadata:
+              name: kube-state-metrics
+            rules:
+            - apiGroups: [""]
+              resources:
+              - configmaps
+              - secrets
+              - nodes
+              - pods
+              - services
+              - resourcequotas
+              - replicationcontrollers
+              - limitranges
+              - persistentvolumeclaims
+              - persistentvolumes
+              verbs: ["list", "watch"]
+            - apiGroups: ["extensions"]
+              resources:
+              - daemonsets
+              - deployments
+              - replicasets
+              - ingresses
+              verbs: ["list", "watch"]
+            - apiGroups: ["apps"]
+              resources:
+              - daemonsets
+              - deployments
+              - replicasets
+              - statefulsets
+              verbs: ["list", "watch"]
+            - apiGroups: ["batch"]
+              resources:
+              - cronjobs
+              - jobs
+              verbs: ["list", "watch"]
+            ---
+            apiVersion: rbac.authorization.k8s.io/v1
+            kind: ClusterRoleBinding
+            metadata:
+              name: kube-state-metrics
+            roleRef:
+              apiGroup: rbac.authorization.k8s.io
+              kind: ClusterRole
+              name: kube-state-metrics
+            subjects:
+            - kind: ServiceAccount
+              name: kube-state-metrics
+              namespace: monitoring
+            ---
+            apiVersion: v1
+            kind: Service
+            metadata:
+              name: kube-state-metrics
+              namespace: monitoring
+            spec:
+              selector:
+                app: kube-state-metrics
+              ports:
+              - port: 8080
+                targetPort: 8080
+            EOF
+          ignore_errors: yes
+          changed_when: false
+
+      when: kubectl_check is succeeded and kubelet_check is succeeded
+      ignore_errors: yes
+
+  post_tasks:
+    - name: Display container metrics configuration summary
+      debug:
+        msg: |
+          ====== Container Metrics Collection Summary ======
+
+          Node: {{ ansible_hostname }}
+
+          Detected Components:
+          ─────────────────────────────────────────
+          {% if docker_check is succeeded %}
+          ✓ Docker detected
+            Metrics available at: http://{{ ansible_default_ipv4.address }}:9323/metrics
+            Add to Prometheus scrape_configs:
+              - job_name: 'docker-{{ ansible_hostname }}'
+                static_configs:
+                  - targets: ['{{ ansible_default_ipv4.address }}:9323']
+          {% else %}
+          ✗ Docker not detected
+          {% endif %}
+
+          {% if containerd_check is succeeded %}
+          ✓ Containerd detected
+            cAdvisor metrics available at: http://{{ ansible_default_ipv4.address }}:{{ cadvisor_port }}/metrics
+            Add to Prometheus scrape_configs:
+              - job_name: 'cadvisor-{{ ansible_hostname }}'
+                static_configs:
+                  - targets: ['{{ ansible_default_ipv4.address }}:{{ cadvisor_port }}']
+          {% else %}
+          ✗ Containerd not detected
+          {% endif %}
+
+          {% if kubectl_check is succeeded and kubelet_check is succeeded %}
+          ✓ Kubernetes/K3s detected
+            Kubelet metrics available at: https://{{ ansible_default_ipv4.address }}:{{ kubelet_metrics_port }}/metrics
+            kube-state-metrics available at: http://{{ ansible_default_ipv4.address }}:8080/metrics
+            Add to Prometheus scrape_configs:
+              - job_name: 'kubelet-{{ ansible_hostname }}'
+                scheme: https
+                tls_config:
+                  insecure_skip_verify: true
+                static_configs:
+                  - targets: ['{{ ansible_default_ipv4.address }}:{{ kubelet_metrics_port }}']
+          {% else %}
+          ✗ Kubernetes/K3s not detected
+          {% endif %}
+
+          ================================================
+
+    - name: Verify metrics are accessible
+      shell: |
+        echo "Testing metrics endpoints..."
+        {% if docker_check is succeeded %}
+        curl -s http://localhost:9323/metrics 2>/dev/null | head -3 && echo "✓ Docker metrics OK" || echo "✗ Docker metrics failed"
+        {% endif %}
+        {% if containerd_check is succeeded %}
+        curl -s http://localhost:{{ cadvisor_port }}/metrics 2>/dev/null | head -3 && echo "✓ cAdvisor metrics OK" || echo "✗ cAdvisor metrics failed"
+        {% endif %}
+      changed_when: false
+      ignore_errors: yes

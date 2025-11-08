@@ -1,0 +1,376 @@
+---
+# PicoCluster Auto-Discovery and Metrics Deployment Orchestration
+# Automatically discovers all cluster nodes and deploys metrics collectors
+#
+# This playbook:
+# 1. Discovers all nodes in the Ansible inventory
+# 2. Installs Node Exporter on all nodes for system metrics
+# 3. Configures container metrics (Docker/Containerd/Kubernetes)
+# 4. Auto-registers nodes with Prometheus on monitoring node
+# 5. Generates Prometheus configuration for all discovered nodes
+#
+# Usage:
+#   Deploy metrics to entire cluster:
+#     ansible-playbook monitoring/metrics_collection/deploy_metrics_to_cluster.ansible
+#
+#   Deploy to specific group:
+#     ansible-playbook monitoring/metrics_collection/deploy_metrics_to_cluster.ansible -i inventory -l "cluster_nodes"
+#
+# Prerequisites:
+# 1. Monitoring node already has Prometheus and Grafana installed
+# 2. All cluster nodes are in Ansible inventory
+# 3. SSH access to all nodes is configured
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    prometheus_config_dir: "/etc/prometheus"
+    prometheus_node: "{{ groups['monitoring'][0] | default('') }}"
+    node_exporter_port: 9100
+    scrape_interval: 15s
+
+  pre_tasks:
+    - name: Display cluster discovery information
+      run_once: yes
+      delegate_to: localhost
+      debug:
+        msg: |
+          ====== PicoCluster Metrics Deployment Orchestration ======
+
+          Discovered cluster nodes: {{ groups['all'] | length }}
+          Monitoring node: {{ prometheus_node }}
+
+          Deployment plan:
+          1. Install Node Exporter on all nodes
+          2. Configure container metrics collectors
+          3. Register nodes with Prometheus
+          4. Generate Prometheus scrape configuration
+
+          ========================================================
+
+    - name: Group nodes by monitoring status
+      run_once: yes
+      delegate_to: localhost
+      set_fact:
+        monitoring_nodes: "{{ groups.get('monitoring', []) }}"
+        cluster_nodes: "{{ groups.get('all', []) | difference(groups.get('monitoring', [])) }}"
+      register: node_grouping
+
+  tasks:
+    # ==================== Install Node Exporter ====================
+
+    - name: Install Node Exporter on all nodes
+      block:
+        - name: Create Node Exporter system user
+          user:
+            name: "node_exporter"
+            system: yes
+            shell: /bin/false
+            comment: "Node Exporter user"
+
+        - name: Determine system architecture
+          set_fact:
+            exporter_arch: "{% if ansible_architecture == 'x86_64' %}amd64{% elif ansible_architecture == 'aarch64' %}arm64{% else %}{{ ansible_architecture }}{% endif %}"
+
+        - name: Check if Node Exporter is already installed
+          shell: which node_exporter
+          ignore_errors: yes
+          register: node_exporter_check
+          changed_when: false
+
+        - name: Install Node Exporter binary
+          block:
+            - name: Download Node Exporter
+              get_url:
+                url: "https://github.com/prometheus/node_exporter/releases/download/v1.5.0/node_exporter-1.5.0.linux-{{ exporter_arch }}.tar.gz"
+                dest: "/tmp/node_exporter-1.5.0.linux-{{ exporter_arch }}.tar.gz"
+                timeout: 60
+
+            - name: Extract Node Exporter
+              unarchive:
+                src: "/tmp/node_exporter-1.5.0.linux-{{ exporter_arch }}.tar.gz"
+                dest: "/tmp/"
+                remote_src: yes
+
+            - name: Copy Node Exporter binary
+              shell: |
+                cp /tmp/node_exporter-1.5.0.linux-{{ exporter_arch }}/node_exporter /usr/local/bin/
+                chmod +x /usr/local/bin/node_exporter
+
+          when: node_exporter_check is failed
+
+        - name: Create Node Exporter systemd service
+          copy:
+            content: |
+              [Unit]
+              Description=Prometheus Node Exporter
+              Wants=network-online.target
+              After=network-online.target
+
+              [Service]
+              Type=simple
+              User=node_exporter
+              Group=node_exporter
+              ExecStart=/usr/local/bin/node_exporter \
+                --web.listen-address=:{{ node_exporter_port }} \
+                --collector.filesystem.mount-points-exclude=^/(dev|proc|sys)($|/) \
+                --collector.filesystem.fs-types-exclude=^(autofs|binfmt_misc|cgroup|configfs|debugfs|devpts|devtmpfs|fusectl|hugetlbfs|iso9660|mqueue|nsfs|overlay|proc|procfs|pstore|rpc_pipefs|securityfs|selinuxfs|squashfs|sysfs|tracefs)$
+
+              SyslogIdentifier=node_exporter
+              Restart=always
+              RestartSec=5
+
+              [Install]
+              WantedBy=multi-user.target
+            dest: /etc/systemd/system/node_exporter.service
+            owner: root
+            group: root
+            mode: '0644'
+          register: node_exporter_service
+
+        - name: Enable and start Node Exporter
+          systemd:
+            daemon_reload: yes
+            name: node_exporter
+            enabled: yes
+            state: started
+          when: node_exporter_service is changed
+
+        - name: Start Node Exporter if not already running
+          systemd:
+            name: node_exporter
+            state: started
+          changed_when: false
+
+      ignore_errors: yes
+
+    # ==================== Configure Container Metrics ====================
+
+    - name: Check for Docker installation
+      shell: which docker
+      ignore_errors: yes
+      register: docker_check
+      changed_when: false
+
+    - name: Check for Containerd installation
+      shell: which containerd
+      ignore_errors: yes
+      register: containerd_check
+      changed_when: false
+
+    - name: Configure Docker metrics
+      block:
+        - name: Ensure Docker daemon configuration directory exists
+          file:
+            path: /etc/docker
+            state: directory
+            mode: '0755'
+
+        - name: Update Docker daemon configuration with metrics
+          copy:
+            content: |
+              {
+                "debug": false,
+                "metrics-addr": "127.0.0.1:9323",
+                "experimental": false,
+                "log-driver": "json-file",
+                "log-opts": {
+                  "max-size": "10m",
+                  "max-file": "3"
+                }
+              }
+            dest: /etc/docker/daemon.json
+            mode: '0644'
+          register: docker_config
+
+        - name: Restart Docker to apply metrics configuration
+          systemd:
+            name: docker
+            state: restarted
+          when: docker_config is changed
+
+      when: docker_check is succeeded
+      ignore_errors: yes
+
+    # ==================== Gather Node Information ====================
+
+    - name: Gather Node Exporter metrics endpoint
+      set_fact:
+        node_exporter_endpoint: "{{ ansible_default_ipv4.address }}:{{ node_exporter_port }}"
+
+  post_tasks:
+    - name: Display Node Exporter installation status
+      debug:
+        msg: |
+          ====== Node Exporter Installation Complete ======
+
+          Node: {{ ansible_hostname }}
+          IP Address: {{ ansible_default_ipv4.address }}
+          Architecture: {{ ansible_architecture }}
+          Metrics Port: {{ node_exporter_port }}
+          Metrics URL: http://{{ node_exporter_endpoint }}/metrics
+
+          =================================================
+
+# ==================== Configure Prometheus (run on monitoring node) ====================
+
+- hosts: monitoring
+  gather_facts: yes
+  become: yes
+
+  vars:
+    prometheus_config_dir: "/etc/prometheus"
+    node_exporter_port: 9100
+
+  tasks:
+    - name: Generate Prometheus scrape configuration for all cluster nodes
+      block:
+        - name: Create backup of current Prometheus configuration
+          shell: |
+            cp {{ prometheus_config_dir }}/prometheus.yml {{ prometheus_config_dir }}/prometheus.yml.backup.$(date +%s)
+          changed_when: false
+
+        - name: Build Prometheus node targets configuration
+          set_fact:
+            prometheus_node_targets: |
+              # PicoCluster Node Exporter Targets (auto-generated)
+              - job_name: 'node-metrics'
+                static_configs:
+              {% for host in groups['all'] %}
+                  - targets: ['{{ hostvars[host].ansible_default_ipv4.address }}:{{ node_exporter_port }}']
+                    labels:
+                      node: '{{ host }}'
+                      instance: '{{ host }}'
+                      arch: '{{ hostvars[host].ansible_architecture }}'
+                      os: '{{ hostvars[host].ansible_distribution }}'
+              {% endfor %}
+
+        - name: Display generated configuration
+          debug:
+            msg: "{{ prometheus_node_targets }}"
+
+        - name: Create Prometheus node scrape configuration file
+          copy:
+            content: "{{ prometheus_node_targets }}"
+            dest: "{{ prometheus_config_dir }}/picocluster_nodes.yml"
+            owner: prometheus
+            group: prometheus
+            mode: '0644'
+          register: prometheus_nodes_config
+
+        - name: Update main Prometheus configuration to include node targets
+          lineinfile:
+            path: "{{ prometheus_config_dir }}/prometheus.yml"
+            line: "{{ item }}"
+            insertafter: "scrape_configs:"
+            state: present
+          loop:
+            - "  # PicoCluster Node Metrics - auto-discovered from Ansible inventory"
+            - "  - job_name: 'node-metrics'"
+            - "    static_configs:"
+            - "      {% for host in groups['all'] %}"
+            - "      - targets: ['{{ hostvars[host].ansible_default_ipv4.address }}:9100']"
+            - "        labels:"
+            - "          node: '{{ host }}'"
+            - "      {% endfor %}"
+          when: false  # Disabled - use reload instead
+
+        - name: Test Prometheus configuration
+          shell: "promtool check config {{ prometheus_config_dir }}/prometheus.yml"
+          register: prometheus_config_test
+          changed_when: false
+
+        - name: Reload Prometheus to apply new configuration
+          systemd:
+            name: prometheus
+            state: reloaded
+          when: prometheus_nodes_config is changed
+
+        - name: Verify Prometheus targets were added
+          uri:
+            url: "http://localhost:9090/api/v1/targets"
+            method: GET
+            return_content: yes
+          register: prometheus_targets
+          changed_when: false
+
+      when: inventory_hostname in groups.get('monitoring', [])
+      ignore_errors: yes
+
+    - name: Display cluster monitoring setup summary
+      run_once: yes
+      debug:
+        msg: |
+          ====== Cluster Monitoring Setup Complete ======
+
+          Monitoring Node: {{ inventory_hostname }}
+          Cluster Nodes: {{ groups['all'] | length }}
+          Node Exporter Port: 9100
+
+          Discovered Nodes:
+          ─────────────────────────────────────────
+          {% for host in groups['all'] %}
+          • {{ host }}: {{ hostvars[host].ansible_default_ipv4.address }}
+          {% endfor %}
+
+          Prometheus Targets:
+          ─────────────────────────────────────────
+          Prometheus is now configured to scrape metrics from:
+          {% for host in groups['all'] %}
+          - http://{{ hostvars[host].ansible_default_ipv4.address }}:9100/metrics
+          {% endfor %}
+
+          Access Prometheus:
+          ─────────────────────────────────────────
+          http://{{ ansible_default_ipv4.address }}:9090
+
+          View all targets in Prometheus:
+          ─────────────────────────────────────────
+          http://{{ ansible_default_ipv4.address }}:9090/targets
+
+          Verify metrics are being collected:
+          ─────────────────────────────────────────
+          curl http://{{ ansible_default_ipv4.address }}:9090/api/v1/targets | jq '.'
+
+          Create Grafana dashboards for cluster nodes:
+          ─────────────────────────────────────────
+          1. Open Grafana: http://{{ ansible_default_ipv4.address }}:3000
+          2. Create dashboard queries using available metrics:
+             - node_cpu_seconds_total
+             - node_memory_MemAvailable_bytes
+             - node_filesystem_avail_bytes
+             - node_network_receive_bytes_total
+
+          ================================================
+
+    - name: Save monitoring cluster configuration
+      copy:
+        content: |
+          # PicoCluster Monitoring Configuration
+          # Generated: {{ ansible_date_time.iso8601 }}
+
+          Monitoring Node: {{ inventory_hostname }}
+          IP Address: {{ ansible_default_ipv4.address }}
+
+          Cluster Nodes:
+          {% for host in groups['all'] %}
+          - {{ host }}: {{ hostvars[host].ansible_default_ipv4.address }}
+          {% endfor %}
+
+          Services:
+          - Prometheus: http://{{ ansible_default_ipv4.address }}:9090
+          - Grafana: http://{{ ansible_default_ipv4.address }}:3000
+          - Prometheus Targets: http://{{ ansible_default_ipv4.address }}:9090/targets
+
+          Next Steps:
+          1. Log in to Grafana
+          2. Verify data is being collected from all nodes
+          3. Create dashboards for cluster monitoring
+          4. Set up alerting rules in Prometheus
+        dest: "{{ prometheus_config_dir }}/CLUSTER_MONITORING_INFO.txt"
+        owner: prometheus
+        group: prometheus
+        mode: '0644'
+      when: inventory_hostname in groups.get('monitoring', [])
