@@ -1,0 +1,290 @@
+---
+# Setup Ceph cluster on RPI5 Ubuntu nodes
+# Converts initialized Ceph nodes into a distributed cluster
+# Requires minimum 3 nodes for data replication and reliability
+# Usage: ansible-playbook setup_ceph_cluster_ubuntu.ansible
+
+- hosts: cluster
+  gather_facts: yes
+  become: yes
+
+  vars:
+    ceph_release: "reef"
+    ceph_fsid: "{{ ansible_date_time.iso8601_basic_short | hash('md5') }}"
+
+  pre_tasks:
+    - name: Validate cluster has at least 3 nodes
+      assert:
+        that:
+          - groups['cluster'] is defined
+          - groups['cluster'] | length >= 3
+        fail_msg: "Ceph cluster requires minimum 3 nodes for proper replication"
+
+    - name: Validate master and worker groups
+      assert:
+        that:
+          - groups['master'] is defined
+          - groups['master'] | length > 0
+        fail_msg: "Must define [master] group in inventory"
+
+  # Configure monitor cluster
+- hosts: cluster
+  gather_facts: yes
+  become: yes
+
+  vars:
+    ceph_release: "reef"
+
+  tasks:
+    - name: Install Ceph packages
+      apt:
+        name:
+          - ceph
+          - ceph-mon
+          - ceph-osd
+          - ceph-mgr
+          - curl
+          - vim
+          - net-tools
+          - jq
+        state: present
+
+    - name: Create Ceph directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /etc/ceph
+        - /var/lib/ceph
+        - /var/lib/ceph/mon
+        - /var/lib/ceph/osd
+        - /var/lib/ceph/mgr
+
+  # Configure primary monitor
+- hosts: master
+  gather_facts: yes
+  become: yes
+
+  vars:
+    ceph_release: "reef"
+    ceph_fsid: "{{ ansible_date_time.iso8601_basic_short | hash('md5') }}"
+
+  tasks:
+    - name: Generate Ceph cluster configuration
+      copy:
+        dest: /etc/ceph/ceph.conf
+        content: |
+          # Ceph Cluster Configuration (RPI5 Ubuntu)
+
+          [global]
+          fsid = {{ ceph_fsid }}
+          mon_initial_members = {% for host in groups['cluster'] %}{{ host }}{{ "," if not loop.last else "" }}{% endfor %}
+
+          mon_host = {% for host in groups['cluster'] %}{{ hostvars[host]['ansible_default_ipv4']['address'] }}{% if not loop.last %},{% endif %}{% endfor %}
+
+          auth_cluster_required = cephx
+          auth_service_required = cephx
+          auth_client_required = cephx
+          osd_journal_size = 1024
+
+          {% for host in groups['cluster'] %}
+          [mon.{{ host }}]
+          host = {{ host }}
+          mon_addr = {{ hostvars[host]['ansible_default_ipv4']['address'] }}:6789
+
+          {% endfor %}
+          [osd]
+          osd_pool_default_size = 3
+          osd_pool_default_min_size = 2
+          osd_pool_default_pg_num = 32
+          osd_pool_default_pgp_num = 32
+          filestore_xattr_use_omap = true
+
+          [mgr]
+          mgr modules = dashboard
+
+        owner: ceph
+        group: ceph
+        mode: '0644'
+
+    - name: Initialize primary monitor
+      shell: |
+        monmaptool --create \
+          {% for host in groups['cluster'] %}\
+          --add {{ host }} {{ hostvars[host]['ansible_default_ipv4']['address'] }}:6789 \
+          {% endfor %}\
+          /tmp/monmap && echo "monmap-created"
+      register: monmap_result
+      changed_when: "'monmap-created' in monmap_result.stdout"
+
+    - name: Create and start primary monitor
+      block:
+        - name: Create bootstrap keyring
+          shell: |
+            ceph-authtool --create-keyring /tmp/ceph.mon.keyring --gen-key -n mon. --cap mon 'allow *'
+            ceph-authtool --create-keyring /etc/ceph/ceph.client.admin.keyring --gen-key -n client.admin --cap mon 'allow *' --cap osd 'allow *' --cap mds 'allow *' --cap mgr 'allow *'
+            ceph-authtool /tmp/ceph.mon.keyring --import-keyring /etc/ceph/ceph.client.admin.keyring
+          ignore_errors: yes
+
+        - name: Initialize primary monitor directory
+          shell: |
+            mkdir -p /var/lib/ceph/mon/ceph-{{ inventory_hostname }}
+            ceph-mon --mkfs -i {{ inventory_hostname }} --monmap /tmp/monmap --keyring /tmp/ceph.mon.keyring
+          ignore_errors: yes
+
+        - name: Start primary monitor
+          systemd:
+            name: ceph-mon@{{ inventory_hostname }}
+            daemon_reload: yes
+            enabled: yes
+            state: started
+
+    - name: Wait for cluster to stabilize
+      pause:
+        seconds: 15
+
+    - name: Display primary monitor status
+      shell: ceph -s
+      register: cluster_status
+      ignore_errors: yes
+
+    - name: Show cluster status
+      debug:
+        msg: |
+          Primary Monitor Initialized (Ubuntu):
+          {{ cluster_status.stdout_lines | join('\n') }}
+
+  # Join additional monitors
+- hosts: worker
+  gather_facts: yes
+  become: yes
+
+  tasks:
+    - name: Distribute Ceph configuration
+      synchronize:
+        src: /etc/ceph/ceph.conf
+        dest: /etc/ceph/ceph.conf
+        mode: push
+      delegate_to: "{{ groups['master'][0] }}"
+      ignore_errors: yes
+
+    - name: Distribute admin keyring
+      synchronize:
+        src: /etc/ceph/ceph.client.admin.keyring
+        dest: /etc/ceph/ceph.client.admin.keyring
+        mode: push
+      delegate_to: "{{ groups['master'][0] }}"
+      ignore_errors: yes
+
+    - name: Create monitor directory
+      file:
+        path: /var/lib/ceph/mon/ceph-{{ inventory_hostname }}
+        state: directory
+        owner: ceph
+        group: ceph
+        mode: '0700'
+
+    - name: Bootstrap additional monitor
+      shell: |
+        ceph mon getmap -o /tmp/monmap
+        ceph-mon -i {{ inventory_hostname }} --mkfs --monmap /tmp/monmap --keyring /etc/ceph/ceph.client.admin.keyring
+      ignore_errors: yes
+
+    - name: Start monitor on worker node
+      systemd:
+        name: ceph-mon@{{ inventory_hostname }}
+        daemon_reload: yes
+        enabled: yes
+        state: started
+      ignore_errors: yes
+
+  # Setup managers
+- hosts: cluster
+  gather_facts: yes
+  become: yes
+
+  tasks:
+    - name: Create manager directory
+      file:
+        path: /var/lib/ceph/mgr/ceph-{{ inventory_hostname }}
+        state: directory
+        owner: ceph
+        group: ceph
+        mode: '0700'
+
+    - name: Create manager keyring
+      shell: |
+        ceph auth get-or-create mgr.{{ inventory_hostname }} mon 'allow profile mgr' osd 'allow *' mds 'allow *'
+        ceph auth get-or-create-key client.admin -o /var/lib/ceph/mgr/ceph-{{ inventory_hostname }}/keyring
+      delegate_to: "{{ groups['master'][0] }}"
+      ignore_errors: yes
+
+    - name: Start manager service
+      systemd:
+        name: ceph-mgr@{{ inventory_hostname }}
+        daemon_reload: yes
+        enabled: yes
+        state: started
+      ignore_errors: yes
+
+  # Display final cluster status
+- hosts: master
+  gather_facts: yes
+
+  tasks:
+    - name: Get cluster status
+      shell: |
+        echo "=== Cluster Status ==="
+        ceph -s
+        echo ""
+        echo "=== Monitor Status ==="
+        ceph mon stat
+        echo ""
+        echo "=== OSD Tree ==="
+        ceph osd tree
+      register: final_status
+      ignore_errors: yes
+
+    - name: Display cluster configuration
+      debug:
+        msg: |
+          ====== Ceph Cluster Setup Complete (RPI5 Ubuntu) ======
+
+          {{ final_status.stdout }}
+
+          Cluster Nodes: {{ groups['cluster'] | join(', ') }}
+          Primary Monitor: {{ inventory_hostname }}
+          Worker Monitors: {{ groups['worker'] | join(', ') if groups['worker'] is defined else 'none' }}
+
+          Next Steps - Add OSDs to Cluster:
+          1. On each node, prepare disk (e.g., /dev/sdb):
+             sudo ceph-volume lvm prepare --data /dev/sdb
+
+          2. Activate OSDs:
+             sudo ceph-volume lvm activate --all
+
+          3. Verify OSDs joined:
+             ceph osd tree
+
+          Create Storage Pools:
+          1. RBD Pool for block storage:
+             ceph osd pool create rbd 32 32
+             ceph osd pool application enable rbd rbd
+
+          2. CephFS Pools (requires 2+ MDS nodes):
+             ceph osd pool create cephfs_data 32 32
+             ceph osd pool create cephfs_metadata 32 32
+             ceph fs new myfs cephfs_metadata cephfs_data
+
+          Common Commands:
+            ceph -s                       - Cluster status
+            ceph osd tree                 - OSD tree
+            ceph mon stat                 - Monitor status
+            ceph auth list                - List authorized entities
+            ceph dashboard ac-user-create admin -i - # Create dashboard user
+
+          Enable Dashboard:
+            ceph mgr module enable dashboard
+            Access at: https://{{ ansible_default_ipv4.address }}:8443
+

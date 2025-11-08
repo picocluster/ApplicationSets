@@ -1,0 +1,222 @@
+---
+# Install Ceph (distributed storage) on single Odroid H4 node
+# Ceph provides object storage, block storage, and file storage
+# Usage: ansible-playbook install_ceph_single.ansible -l pc0
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    ceph_release: "reef"  # Latest stable release
+    ceph_fsid: "{{ ansible_date_time.iso8601_basic_short | hash('md5') }}"
+    ceph_mon_initial_members: "{{ inventory_hostname }}"
+    ceph_mon_host: "{{ ansible_default_ipv4.address }}"
+
+  tasks:
+    - name: Update package manager cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Add Ceph repository key
+      apt_key:
+        url: "https://download.ceph.com/keys/release.asc"
+        state: present
+
+    - name: Add Ceph repository
+      apt_repository:
+        repo: "deb https://download.ceph.com/debian-{{ ceph_release }}/ {{ ansible_distribution_release }} main"
+        state: present
+        filename: ceph-release
+
+    - name: Install Ceph packages
+      apt:
+        name:
+          - ceph
+          - ceph-mon
+          - ceph-osd
+          - ceph-mgr
+          - ceph-mds
+          - ceph-common
+          - curl
+          - vim
+          - net-tools
+          - jq
+        state: present
+
+    - name: Create Ceph directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /etc/ceph
+        - /var/lib/ceph
+        - /var/lib/ceph/mon
+        - /var/lib/ceph/osd
+        - /var/lib/ceph/mgr
+        - /var/log/ceph
+
+    - name: Generate Ceph configuration
+      copy:
+        dest: /etc/ceph/ceph.conf
+        content: |
+          # Ceph Configuration for single node
+
+          [global]
+          fsid = {{ ceph_fsid }}
+          mon_initial_members = {{ ceph_mon_initial_members }}
+          mon_host = {{ ceph_mon_host }}
+          auth_cluster_required = cephx
+          auth_service_required = cephx
+          auth_client_required = cephx
+          osd_journal_size = 1024
+
+          [mon.{{ inventory_hostname }}]
+          host = {{ inventory_hostname }}
+          mon_addr = {{ ceph_mon_host }}:6789
+
+          [osd]
+          osd_pool_default_size = 1
+          osd_pool_default_min_size = 1
+          osd_pool_default_pg_num = 32
+          osd_pool_default_pgp_num = 32
+          filestore_xattr_use_omap = true
+
+        owner: ceph
+        group: ceph
+        mode: '0644'
+
+    - name: Generate Ceph bootstrap key
+      block:
+        - name: Check if bootstrap key exists
+          stat:
+            path: /etc/ceph/ceph.bootstrap-osd.keyring
+          register: bootstrap_key_stat
+
+        - name: Create monitor key
+          shell: ceph-authtool --create-keyring /tmp/ceph.mon.keyring --gen-key -n mon. --cap mon 'allow *'
+          when: not bootstrap_key_stat.exists
+
+        - name: Create admin key
+          shell: ceph-authtool --create-keyring /etc/ceph/ceph.client.admin.keyring --gen-key -n client.admin --cap mon 'allow *' --cap osd 'allow *' --cap mds 'allow *' --cap mgr 'allow *'
+          when: not bootstrap_key_stat.exists
+
+        - name: Create OSD bootstrap key
+          shell: ceph-authtool --create-keyring /var/lib/ceph/bootstrap-osd/ceph.keyring --gen-key -n client.bootstrap-osd --cap mon 'profile bootstrap-osd'
+          when: not bootstrap_key_stat.exists
+
+    - name: Initialize monitor
+      block:
+        - name: Check if monitor is initialized
+          shell: test -f /var/lib/ceph/mon/ceph-{{ inventory_hostname }}/keyring && echo "initialized" || echo "not-initialized"
+          register: mon_status
+          changed_when: false
+
+        - name: Create monitor directory
+          shell: mkdir -p /var/lib/ceph/mon/ceph-{{ inventory_hostname }}
+
+        - name: Generate monitor map
+          shell: |
+            monmaptool --create --add {{ inventory_hostname }} {{ ceph_mon_host }}:6789 /tmp/monmap
+          when: mon_status.stdout == "not-initialized"
+
+        - name: Populate monitor keyring
+          shell: |
+            ceph-mon --mkfs -i {{ inventory_hostname }} --monmap /tmp/monmap --keyring /tmp/ceph.mon.keyring
+          when: mon_status.stdout == "not-initialized"
+
+        - name: Start and enable monitor service
+          systemd:
+            name: ceph-mon@{{ inventory_hostname }}
+            daemon_reload: yes
+            enabled: yes
+            state: started
+
+    - name: Initialize manager
+      block:
+        - name: Create manager keyring
+          shell: ceph auth get-or-create mgr.{{ inventory_hostname }} mon 'allow profile mgr' osd 'allow *' mds 'allow *'
+          ignore_errors: yes
+
+        - name: Create manager directory
+          file:
+            path: /var/lib/ceph/mgr/ceph-{{ inventory_hostname }}
+            state: directory
+            owner: ceph
+            group: ceph
+            mode: '0700'
+
+        - name: Get manager keyring
+          shell: ceph auth print-key client.admin > /var/lib/ceph/mgr/ceph-{{ inventory_hostname }}/keyring
+          ignore_errors: yes
+
+        - name: Start and enable manager service
+          systemd:
+            name: ceph-mgr@{{ inventory_hostname }}
+            daemon_reload: yes
+            enabled: yes
+            state: started
+          ignore_errors: yes
+
+    - name: Wait for cluster to initialize
+      pause:
+        seconds: 10
+
+    - name: Verify Ceph cluster
+      shell: |
+        ceph -s
+        ceph osd tree
+      register: ceph_status
+      ignore_errors: yes
+
+    - name: Display Ceph setup complete
+      debug:
+        msg: |
+          ====== Ceph Single-Node Installation Complete (Odroid H4) ======
+
+          Cluster Status:
+          {{ ceph_status.stdout_lines | join('\n') }}
+
+          Configuration: /etc/ceph/ceph.conf
+          Admin Keyring: /etc/ceph/ceph.client.admin.keyring
+
+          Common Commands:
+            ceph -s                       - Cluster status
+            ceph osd tree                 - OSD hierarchy
+            ceph df                       - Disk usage
+            ceph mon stat                 - Monitor status
+            ceph auth list                - Authenticated entities
+
+          Add OSD to Cluster:
+            1. Prepare disk (e.g., /dev/sdb):
+               sudo ceph-volume lvm prepare --data /dev/sdb
+
+            2. Activate OSD:
+               sudo ceph-volume lvm activate --all
+
+            3. Verify OSD joined:
+               ceph osd tree
+
+          Create RBD Pool (for block storage):
+            ceph osd pool create rbd 32 32
+            ceph osd pool application enable rbd rbd
+            rbd create --size 10G volume1
+
+          Create CephFS (requires 2+ MDS nodes in production):
+            ceph osd pool create cephfs_data 32 32
+            ceph osd pool create cephfs_metadata 32 32
+            ceph fs new myfs cephfs_metadata cephfs_data
+
+          Access Web Dashboard:
+            1. Enable dashboard:
+               ceph mgr module enable dashboard
+
+            2. Create dashboard user:
+               ceph dashboard ac-user-create admin -i -
+
+            3. Access at: https://{{ ansible_default_ipv4.address }}:8443
+
+          Next: Set up Ceph cluster with setup_ceph_cluster.ansible
+
