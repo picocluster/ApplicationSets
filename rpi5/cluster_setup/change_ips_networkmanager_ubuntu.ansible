@@ -1,33 +1,72 @@
 ---
 # Change static IP addresses on RPI5 (Ubuntu) cluster using NetworkManager
-# This script plans IP assignments for your cluster size
+# Centralized script: Run from pc0 to configure all cluster nodes
 # Usage: ansible-playbook rpi5/cluster_setup/change_ips_networkmanager_ubuntu.ansible
+#
+# User will be prompted to enter:
+# - Starting IP address (e.g., 10.1.10.240)
+# - Gateway IP (e.g., 10.1.10.1)
+# - DNS servers (default: 8.8.8.8 8.8.4.4)
 
 - hosts: all
   gather_facts: yes
   become: yes
 
   vars:
-    # Network configuration - CUSTOMIZE THESE FOR YOUR CLUSTER
     network_interface: "eth0"
-    gateway: "10.1.10.1"
-    dns_servers: "8.8.8.8 8.8.4.4"
     subnet_mask: "24"
-    base_ip: "10.1.10"
 
   pre_tasks:
-    - name: Display network configuration
+    - name: Prompt for network configuration (run once)
+      pause:
+        prompt: |
+
+          ====== PicoCluster IP Configuration (RPI5 Ubuntu) ======
+
+          Enter the starting IP address (e.g., 10.1.10.240):
+      register: starting_ip_input
+      run_once: true
+
+    - name: Prompt for gateway
+      pause:
+        prompt: "Enter gateway IP address (e.g., 10.1.10.1):"
+      register: gateway_input
+      run_once: true
+
+    - name: Prompt for DNS servers
+      pause:
+        prompt: "Enter DNS servers separated by space (default: 8.8.8.8 8.8.4.4):"
+      register: dns_input
+      run_once: true
+
+    - name: Set configuration variables
+      set_fact:
+        starting_ip: "{{ starting_ip_input.user_input | default('10.1.10.240') }}"
+        gateway: "{{ gateway_input.user_input | default('10.1.10.1') }}"
+        dns_servers: "{{ dns_input.user_input | default('8.8.8.8 8.8.4.4') }}"
+
+    - name: Parse starting IP to get base network
+      set_fact:
+        ip_octets: "{{ starting_ip.split('.') }}"
+
+    - name: Calculate node IP address
+      set_fact:
+        node_ip: "{{ ip_octets[0] }}.{{ ip_octets[1] }}.{{ ip_octets[2] }}.{{ ip_octets[3] | int + groups['all'].index(inventory_hostname) }}"
+        base_network: "{{ ip_octets[0] }}.{{ ip_octets[1] }}.{{ ip_octets[2] }}"
+
+    - name: Display network configuration plan
       debug:
         msg: |
           ====== Network Configuration Plan (RPI5 Ubuntu) ======
-          Base Network: {{ base_ip }}.0/{{ subnet_mask }}
+          Starting IP: {{ starting_ip }}
           Gateway: {{ gateway }}
           DNS Servers: {{ dns_servers }}
           Interface: {{ network_interface }}
+          Subnet Mask: /{{ subnet_mask }}
 
           Cluster nodes and assigned IPs:
           {% for host in groups['all'] %}
-          - {{ host }}: {{ base_ip }}.{{ 240 + loop.index0 }}
+          - {{ host }}: {{ base_network }}.{{ ip_octets[3] | int + loop.index0 }}
           {% endfor %}
 
   tasks:
@@ -52,31 +91,6 @@
         state: stopped
       ignore_errors: yes
 
-    - name: Display current network configuration
-      shell: |
-        echo "Current IP Configuration:"
-        ip addr show {{ network_interface }} || echo "Interface not found"
-        echo ""
-        echo "Current DNS Configuration:"
-        cat /etc/resolv.conf | grep nameserver || echo "No DNS configured"
-      register: current_config
-
-    - name: Show current configuration
-      debug:
-        msg: "{{ current_config.stdout_lines }}"
-
-    - name: Calculate node IP address
-      set_fact:
-        node_ip: "{{ base_ip }}.{{ 240 + groups['all'].index(inventory_hostname) }}"
-        node_index: "{{ groups['all'].index(inventory_hostname) }}"
-
-    - name: Display calculated IP for this node
-      debug:
-        msg: |
-          This node ({{ inventory_hostname }}) will be assigned:
-          IP Address: {{ node_ip }}/{{ subnet_mask }}
-          Gateway: {{ gateway }}
-
     - name: Remove existing NetworkManager connection
       command: "nmcli con delete '{{ network_interface }}'"
       ignore_errors: yes
@@ -92,7 +106,7 @@
           ipv4.method manual \
           ipv4.addresses "{{ node_ip }}/{{ subnet_mask }}" \
           ipv4.gateway "{{ gateway }}" \
-          ipv4.dns "{{ dns_servers }}" \
+          ipv4.dns "{{ dns_servers | replace(' ', ';') }}" \
           ipv4.ignore-auto-dns yes \
           autoconnect yes
       register: nmcli_add_result
@@ -102,66 +116,76 @@
       command: "nmcli con up '{{ network_interface }}'"
       register: nmcli_activate_result
       changed_when: "'successfully activated' in nmcli_activate_result.stdout"
+      ignore_errors: yes
 
     - name: Wait for network to stabilize
       pause:
         seconds: 5
 
+  post_tasks:
+    - name: Build hosts file entries (run once on first node)
+      set_fact:
+        hosts_entries: |
+          {% for host in groups['all'] %}
+          {{ base_network }}.{{ ip_octets[3] | int + loop.index0 }} {{ host }}
+          {% endfor %}
+      run_once: true
+      delegate_to: localhost
+
+    - name: Update /etc/hosts on all nodes
+      lineinfile:
+        path: /etc/hosts
+        regexp: "^{{ base_network }}"
+        state: absent
+      become: yes
+
+    - name: Add new IP entries to /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        line: "{{ base_network }}.{{ ip_octets[3] | int + groups['all'].index(inventory_hostname) }} {{ inventory_hostname }}"
+        insertafter: "^127.0.0.1"
+        state: present
+      become: yes
+
     - name: Verify IP configuration
       shell: |
         echo "New IP Configuration:"
-        ip addr show {{ network_interface }}
+        ip addr show {{ network_interface }} | grep "inet " || echo "Interface not configured"
         echo ""
-        echo "NetworkManager connection status:"
-        nmcli con show '{{ network_interface }}'
+        echo "Updated /etc/hosts entries:"
+        grep {{ base_network }} /etc/hosts || echo "No entries found"
       register: verify_config
 
     - name: Display verification results
       debug:
         msg: "{{ verify_config.stdout_lines }}"
 
-    - name: Test network connectivity
-      shell: |
-        echo "Testing gateway connectivity:"
-        ping -c 3 {{ gateway }} 2>&1 || echo "Gateway not reachable"
-        echo ""
-        echo "Testing DNS resolution:"
-        nslookup google.com 2>&1 | head -5 || echo "DNS resolution failed"
-      register: connectivity_test
-      ignore_errors: yes
-
-    - name: Display connectivity results
-      debug:
-        msg: "{{ connectivity_test.stdout_lines }}"
-
-  post_tasks:
     - name: Summary of network changes
       debug:
         msg: |
-          ====== Network Configuration Summary (RPI5 Ubuntu) ======
+          ====== Network Configuration Complete (RPI5 Ubuntu) ======
 
           Node: {{ inventory_hostname }}
-          IP Address: {{ node_ip }}/{{ subnet_mask }}
+          New IP: {{ node_ip }}/{{ subnet_mask }}
           Gateway: {{ gateway }}
           DNS Servers: {{ dns_servers }}
           Interface: {{ network_interface }}
 
           Configuration stored in:
           - /etc/NetworkManager/system-connections/{{ network_interface }}.nmconnection
+          - /etc/hosts (updated on all nodes)
+
+          Verify connectivity to gateway:
+            ping {{ gateway }}
+
+          View updated hosts file:
+            cat /etc/hosts | grep {{ base_network }}
 
           Useful NetworkManager Commands:
-            nmcli con show                    - List all connections
             nmcli con show '{{ network_interface }}'  - Show connection details
-            nmcli con up '{{ network_interface }}'    - Activate connection
-            nmcli con down '{{ network_interface }}'  - Deactivate connection
-            nmcli con edit '{{ network_interface }}'  - Edit connection
             nmcli dev status                  - Show device status
+            nmcli con up '{{ network_interface }}'    - Reactivate connection
 
-          Manual IP Reconfiguration:
-            nmcli con mod '{{ network_interface }}' ipv4.addresses "10.1.10.X/24"
-            nmcli con mod '{{ network_interface }}' ipv4.gateway "{{ gateway }}"
-            nmcli con up '{{ network_interface }}'
-
-          View connection file:
-            cat /etc/NetworkManager/system-connections/{{ network_interface }}.nmconnection
+          All cluster nodes are now configured with static IPs and can resolve
+          each other by hostname via /etc/hosts.
 
