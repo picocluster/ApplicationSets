@@ -1,0 +1,511 @@
+---
+# Install and configure Loki for centralized log aggregation
+#
+# Loki provides:
+# - Lightweight log aggregation (no indexing)
+# - Integration with Grafana for visualization
+# - LogQL query language (similar to PromQL)
+# - Multi-tenant support
+# - Horizontal scaling capability
+#
+# Architecture:
+#   Cluster Nodes → Promtail → Loki → Grafana
+#
+# Usage:
+#   # Install Loki on logging node
+#   ansible-playbook infrastructure/logging/install_loki.ansible -l logging-node
+#
+#   # Install on monitoring node
+#   ansible-playbook infrastructure/logging/install_loki.ansible -l monitoring
+#
+# Default ports:
+#   - 3100: Loki HTTP API
+#   - 3101: Prometheus metrics
+#
+# Storage:
+#   - Default: /var/lib/loki/chunks (local filesystem)
+#   - Alternative: S3, GCS, MinIO
+#
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    loki_version: "2.8.0"
+    loki_port: 3100
+    loki_metrics_port: 3101
+    loki_user: "loki"
+    loki_group: "loki"
+    loki_home: "/var/lib/loki"
+    loki_config_dir: "/etc/loki"
+    loki_log_dir: "/var/log/loki"
+    # Retention settings
+    retention_days: 7
+    chunk_idle_time: "3m"
+    chunk_max_age: "1h"
+    max_chunk_age: "2h"
+    # Storage
+    storage_type: "filesystem"  # filesystem, s3, gcs, etc.
+
+  pre_tasks:
+    - name: Display Loki installation information
+      debug:
+        msg: |
+          ====== Loki Log Aggregation Setup ======
+
+          Version: {{ loki_version }}
+          Configuration: {{ loki_config_dir }}/loki-config.yml
+          Storage Type: {{ storage_type }}
+          Storage Location: {{ loki_home }}/chunks
+          Retention: {{ retention_days }} days
+          Prometheus Metrics: :{{ loki_metrics_port }}
+
+          Services:
+          • Loki API: 0.0.0.0:{{ loki_port }}/TCP
+          • Metrics: 0.0.0.0:{{ loki_metrics_port }}/TCP
+
+          Data Flow:
+          Cluster Nodes → Promtail → Loki :{{ loki_port }} → Grafana
+
+          ======================================
+
+  tasks:
+    - name: Determine system architecture
+      set_fact:
+        loki_arch: "{% if ansible_architecture == 'x86_64' %}amd64{% elif ansible_architecture == 'aarch64' %}arm64{% else %}{{ ansible_architecture }}{% endif %}"
+
+    - name: Create Loki system user
+      user:
+        name: "{{ loki_user }}"
+        system: yes
+        shell: /bin/false
+        home: "{{ loki_home }}"
+        comment: "Loki user"
+
+    - name: Create Loki directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ loki_user }}"
+        group: "{{ loki_group }}"
+        mode: '0755'
+      loop:
+        - "{{ loki_home }}/chunks"
+        - "{{ loki_home }}/boltdb-shipper-active"
+        - "{{ loki_home }}/boltdb-shipper-cache"
+        - "{{ loki_config_dir }}"
+        - "{{ loki_log_dir }}"
+
+    - name: Check if Loki is already installed
+      shell: which loki
+      ignore_errors: yes
+      register: loki_check
+      changed_when: false
+
+    - name: Download and install Loki
+      block:
+        - name: Download Loki binary
+          get_url:
+            url: "https://github.com/grafana/loki/releases/download/v{{ loki_version }}/loki-linux-{{ loki_arch }}.zip"
+            dest: "/tmp/loki-{{ loki_version }}.zip"
+            timeout: 60
+
+        - name: Extract Loki
+          unarchive:
+            src: "/tmp/loki-{{ loki_version }}.zip"
+            dest: "/tmp/"
+            remote_src: yes
+
+        - name: Install Loki binary
+          shell: |
+            cp /tmp/loki-linux-{{ loki_arch }} /usr/local/bin/loki
+            chmod +x /usr/local/bin/loki
+
+        - name: Verify installation
+          shell: loki -version
+          register: loki_version_check
+          changed_when: false
+
+      when: loki_check is failed
+
+    - name: Create Loki configuration
+      copy:
+        content: |
+          # Loki Configuration for PicoCluster
+          # Lightweight log aggregation system
+
+          auth_enabled: false
+
+          ingester:
+            chunk_idle_period: {{ chunk_idle_time }}
+            chunk_max_age: {{ chunk_max_age }}
+            max_chunk_age: {{ max_chunk_age }}
+            chunk_retain_period: 1m
+            max_transfer_retries: 0
+            lifecycler:
+              ring:
+                kvstore:
+                  store: inmemory
+                replication_factor: 1
+
+          limits_config:
+            enforce_metric_name: false
+            reject_old_samples: true
+            reject_old_samples_max_age: 168h
+            ingestion_rate_mb: 50
+            ingestion_burst_size_mb: 100
+            max_streams_per_user: 1000
+            max_entries_limit_per_second: 10000
+
+          schema_config:
+            configs:
+              - from: 2020-01-01
+                store: boltdb-shipper
+                object_store: filesystem
+                schema: v11
+                index:
+                  prefix: index_
+                  period: 24h
+
+          server:
+            http_listen_port: {{ loki_port }}
+            log_level: info
+            log_format: json
+
+          storage_config:
+            boltdb_shipper:
+              active_index_directory: {{ loki_home }}/boltdb-shipper-active
+              cache_location: {{ loki_home }}/boltdb-shipper-cache
+              max_look_back_period: 0s
+            filesystem:
+              directory: {{ loki_home }}/chunks
+
+          chunk_store_config:
+            max_look_back_period: 0s
+
+          table_manager:
+            retention_deletes_enabled: true
+            retention_period: {{ retention_days * 24 }}h
+
+          metrics:
+            enabled: true
+            prometheus_interval: 60s
+            wal_enabled: true
+            wal_directory: {{ loki_home }}/wal
+        dest: "{{ loki_config_dir }}/loki-config.yml"
+        owner: root
+        group: root
+        mode: '0644'
+      register: loki_config
+
+    - name: Create Loki systemd service
+      copy:
+        content: |
+          [Unit]
+          Description=Loki Log Aggregation Service
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          Type=simple
+          User={{ loki_user }}
+          Group={{ loki_group }}
+          ExecStart=/usr/local/bin/loki -config.file={{ loki_config_dir }}/loki-config.yml
+          Restart=always
+          RestartSec=5
+
+          # Resource limits
+          LimitNOFILE=65536
+          LimitNPROC=512
+
+          SyslogIdentifier=loki
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/loki.service
+        owner: root
+        group: root
+        mode: '0644'
+      register: loki_service
+
+    - name: Enable and start Loki
+      systemd:
+        daemon_reload: yes
+        name: loki
+        enabled: yes
+        state: restarted
+      when: loki_service is changed or loki_config is changed
+
+    - name: Start Loki if not already running
+      systemd:
+        name: loki
+        state: started
+      changed_when: false
+
+    - name: Wait for Loki to be ready
+      uri:
+        url: "http://localhost:{{ loki_port }}/ready"
+        method: GET
+        status_code: 200
+      retries: 30
+      delay: 2
+      changed_when: false
+
+    - name: Create Promtail installation playbook
+      copy:
+        content: |
+          ---
+          # Install Promtail on cluster nodes to ship logs to Loki
+          #
+          # Promtail is the log shipper that:
+          # - Reads logs from system and applications
+          # - Parses and labels logs
+          # - Ships to Loki for aggregation
+          #
+          # Usage:
+          #   ansible-playbook infrastructure/logging/install_promtail.ansible
+          #
+          # Default ports:
+          #   - 9080: Promtail HTTP server
+          #
+
+          - hosts: all
+            gather_facts: yes
+            become: yes
+
+            vars:
+              promtail_version: "2.8.0"
+              promtail_port: 9080
+              promtail_user: "promtail"
+              loki_server: "{{ groups.get('logging', [groups.get('monitoring', ['localhost'])[0]])[0] }}"
+              loki_port: 3100
+
+            tasks:
+              - name: Create Promtail user
+                user:
+                  name: "{{ promtail_user }}"
+                  system: yes
+                  shell: /bin/false
+                  comment: "Promtail user"
+
+              - name: Create Promtail directories
+                file:
+                  path: "{{ item }}"
+                  state: directory
+                  owner: "{{ promtail_user }}"
+                  mode: '0755'
+                loop:
+                  - /etc/promtail
+                  - /var/lib/promtail
+
+              - name: Download Promtail binary
+                get_url:
+                  url: "https://github.com/grafana/loki/releases/download/v{{ promtail_version }}/promtail-linux-amd64.zip"
+                  dest: "/tmp/promtail.zip"
+                  timeout: 60
+
+              - name: Extract Promtail
+                unarchive:
+                  src: "/tmp/promtail.zip"
+                  dest: "/tmp/"
+                  remote_src: yes
+
+              - name: Install Promtail binary
+                shell: |
+                  cp /tmp/promtail-linux-amd64 /usr/local/bin/promtail
+                  chmod +x /usr/local/bin/promtail
+
+              - name: Create Promtail configuration
+                copy:
+                  content: |
+                    server:
+                      http_listen_port: {{ promtail_port }}
+                      log_level: info
+                      log_format: json
+
+                    positions:
+                      filename: /tmp/positions.yaml
+
+                    clients:
+                      - url: http://{{ loki_server }}:{{ loki_port }}/loki/api/v1/push
+
+                    scrape_configs:
+                      # System logs
+                      - job_name: systemd
+                        journal:
+                          max_age: 24h
+                          labels:
+                            job: systemd-journal
+                        relabel_configs:
+                          - source_labels: ['__journal__systemd_unit']
+                            target_label: 'unit'
+                          - source_labels: ['__journal_hostname']
+                            target_label: 'hostname'
+
+                      # Kubernetes logs (if K3s installed)
+                      - job_name: kubernetes
+                        kubernetes_sd_configs:
+                          - role: pod
+                        relabel_configs:
+                          - source_labels: [__meta_kubernetes_pod_node_name]
+                            target_label: node
+                          - source_labels: [__meta_kubernetes_namespace]
+                            target_label: namespace
+                          - source_labels: [__meta_kubernetes_pod_name]
+                            target_label: pod
+                        pipeline_stages:
+                          - json:
+                              expressions:
+                                msg: message
+                          - labels:
+                              msg: ""
+
+                      # Syslog
+                      - job_name: syslog
+                        static_configs:
+                          - targets:
+                              - localhost
+                            labels:
+                              job: syslog
+                              __path__: /var/log/syslog
+
+                      # Application logs
+                      - job_name: application
+                        static_configs:
+                          - targets:
+                              - localhost
+                            labels:
+                              job: applications
+                              __path__: /var/log/applications/*.log
+                  dest: /etc/promtail/config.yml
+                  owner: root
+                  group: root
+                  mode: '0644'
+
+              - name: Create Promtail systemd service
+                copy:
+                  content: |
+                    [Unit]
+                    Description=Promtail Log Shipper
+                    Wants=network-online.target
+                    After=network-online.target
+
+                    [Service]
+                    Type=simple
+                    User={{ promtail_user }}
+                    Group={{ promtail_user }}
+                    ExecStart=/usr/local/bin/promtail -config.file=/etc/promtail/config.yml
+                    Restart=always
+                    RestartSec=5
+
+                    SyslogIdentifier=promtail
+
+                    [Install]
+                    WantedBy=multi-user.target
+                  dest: /etc/systemd/system/promtail.service
+                  owner: root
+                  group: root
+                  mode: '0644'
+
+              - name: Enable and start Promtail
+                systemd:
+                  daemon_reload: yes
+                  name: promtail
+                  enabled: yes
+                  state: started
+        dest: "{{ loki_config_dir }}/install_promtail.ansible"
+        owner: root
+        group: root
+        mode: '0644'
+
+  post_tasks:
+    - name: Display Loki access information
+      debug:
+        msg: |
+          ====== Loki Installation Complete ======
+
+          ✓ Loki installed and running
+          ✓ Listening on 0.0.0.0:{{ loki_port }}/TCP
+          ✓ Storage: {{ loki_home }}/chunks
+          ✓ Retention: {{ retention_days }} days
+
+          Next Steps:
+          ─────────────────────────────────────────
+          1. Install Promtail on all cluster nodes:
+             ansible-playbook {{ loki_config_dir }}/install_promtail.ansible
+
+          2. Add Loki datasource to Grafana:
+             Admin → Data Sources → Add
+             Type: Loki
+             URL: http://{{ ansible_default_ipv4.address }}:{{ loki_port }}
+
+          3. Create log dashboards in Grafana
+
+          4. Query logs using LogQL:
+             {job="systemd-journal"}
+             {namespace="default"} | json
+
+          Access Loki:
+          ─────────────────────────────────────────
+          API: http://{{ ansible_default_ipv4.address }}:{{ loki_port }}
+          Health: http://{{ ansible_default_ipv4.address }}:{{ loki_port }}/ready
+
+          Service Management:
+          ─────────────────────────────────────────
+          sudo systemctl status loki
+          sudo systemctl restart loki
+          sudo journalctl -u loki -f
+
+          Configuration:
+          ─────────────────────────────────────────
+          Location: {{ loki_config_dir }}/loki-config.yml
+          Edit and reload: systemctl restart loki
+
+          Storage:
+          ─────────────────────────────────────────
+          Location: {{ loki_home }}/chunks
+          Retention: {{ retention_days }} days
+          Current size: $(du -sh {{ loki_home }})
+
+          Monitoring:
+          ─────────────────────────────────────────
+          Metrics port: {{ loki_metrics_port }}
+          Add to Prometheus: http://{{ ansible_default_ipv4.address }}:{{ loki_metrics_port }}/metrics
+
+          ==========================================
+
+    - name: Create Loki configuration summary
+      copy:
+        content: |
+          Loki Log Aggregation Configuration
+          Generated: {{ ansible_date_time.iso8601 }}
+
+          Hostname: {{ ansible_hostname }}
+          IP Address: {{ ansible_default_ipv4.address }}
+
+          Configuration:
+          • API Port: {{ loki_port }}/TCP
+          • Metrics Port: {{ loki_metrics_port }}/TCP
+          • Storage Type: {{ storage_type }}
+          • Retention: {{ retention_days }} days
+
+          Configuration Files:
+          • {{ loki_config_dir }}/loki-config.yml
+
+          Storage Location:
+          • {{ loki_home }}/chunks
+
+          Add to Grafana:
+          1. Admin → Data Sources → New
+          2. Type: Loki
+          3. URL: http://{{ ansible_default_ipv4.address }}:{{ loki_port }}
+
+          Query logs with LogQL:
+          {job="systemd-journal"}
+          {namespace="default"} | json
+          {unit="docker.service"} | regex "error"
+        dest: "{{ loki_config_dir }}/CONFIGURATION.txt"
+        owner: root
+        group: root
+        mode: '0644'

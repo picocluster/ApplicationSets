@@ -1,0 +1,442 @@
+---
+# Install and configure CoreDNS for PicoCluster
+#
+# CoreDNS provides:
+# - Internal DNS resolution for cluster services
+# - Service discovery integration with Consul
+# - DNS load balancing
+# - Split-horizon DNS (internal vs external)
+# - Health checking with failover
+#
+# Usage:
+#   # Install CoreDNS on dedicated node
+#   ansible-playbook infrastructure/dns/install_coredns.ansible -l dns-server
+#
+#   # Install on all cluster nodes for redundancy
+#   ansible-playbook infrastructure/dns/install_coredns.ansible
+#
+# Default ports:
+#   - 53/UDP: DNS queries
+#   - 5353/UDP: Prometheus metrics
+#
+# Configuration:
+#   /etc/coredns/Corefile
+#
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    coredns_version: "1.10.0"
+    coredns_port: 53
+    coredns_metrics_port: 5353
+    coredns_user: "coredns"
+    coredns_group: "coredns"
+    coredns_config_dir: "/etc/coredns"
+    coredns_log_dir: "/var/log/coredns"
+    # Cluster domain for service discovery
+    cluster_domain: "cluster.local"
+    # Consul integration (optional)
+    consul_enabled: true
+    consul_server: "localhost:8500"
+    # Forward queries to upstream DNS
+    upstream_dns: "8.8.8.8 8.8.4.4"
+
+  pre_tasks:
+    - name: Display CoreDNS installation information
+      debug:
+        msg: |
+          ====== CoreDNS Installation ======
+
+          Version: {{ coredns_version }}
+          Configuration: {{ coredns_config_dir }}/Corefile
+          Cluster Domain: {{ cluster_domain }}
+          Prometheus Metrics: :{{ coredns_metrics_port }}
+          Upstream DNS: {{ upstream_dns }}
+          Consul Integration: {{ 'Enabled' if consul_enabled else 'Disabled' }}
+
+          Services:
+          • DNS: 0.0.0.0:{{ coredns_port }}/UDP
+          • Metrics: 0.0.0.0:{{ coredns_metrics_port }}/UDP (Prometheus)
+
+          ===================================
+
+  tasks:
+    - name: Determine system architecture
+      set_fact:
+        coredns_arch: "{% if ansible_architecture == 'x86_64' %}amd64{% elif ansible_architecture == 'aarch64' %}arm64{% else %}{{ ansible_architecture }}{% endif %}"
+
+    - name: Create CoreDNS system user
+      user:
+        name: "{{ coredns_user }}"
+        system: yes
+        shell: /bin/false
+        comment: "CoreDNS user"
+
+    - name: Create CoreDNS directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ coredns_user }}"
+        group: "{{ coredns_group }}"
+        mode: '0755'
+      loop:
+        - "{{ coredns_config_dir }}"
+        - "{{ coredns_log_dir }}"
+
+    - name: Check if CoreDNS is already installed
+      shell: which coredns
+      ignore_errors: yes
+      register: coredns_check
+      changed_when: false
+
+    - name: Download and install CoreDNS
+      block:
+        - name: Download CoreDNS binary
+          get_url:
+            url: "https://github.com/coredns/coredns/releases/download/v{{ coredns_version }}/coredns_{{ coredns_version }}_linux_{{ coredns_arch }}.tgz"
+            dest: "/tmp/coredns-{{ coredns_version }}.tgz"
+            timeout: 60
+
+        - name: Extract CoreDNS
+          unarchive:
+            src: "/tmp/coredns-{{ coredns_version }}.tgz"
+            dest: "/tmp/"
+            remote_src: yes
+
+        - name: Install CoreDNS binary
+          shell: |
+            cp /tmp/coredns /usr/local/bin/
+            chmod +x /usr/local/bin/coredns
+
+        - name: Verify installation
+          shell: coredns -version
+          register: coredns_version_check
+          changed_when: false
+
+      when: coredns_check is failed
+
+    - name: Create CoreDNS configuration
+      copy:
+        content: |
+          # CoreDNS Configuration for PicoCluster
+          # Handles DNS queries for cluster services and upstream resolution
+
+          (common) {
+            # Log all DNS queries
+            log
+
+            # Enable Prometheus metrics
+            prometheus 0.0.0.0:{{ coredns_metrics_port }}
+
+            # Health check endpoint
+            health 0.0.0.0:8080
+
+            # Enable caching
+            cache 30
+
+            # Enable query logging
+            log
+          }
+
+          # Main zone: cluster.local (internal services)
+          {{ cluster_domain }}:{{ coredns_port }} {
+            import common
+
+            {% if consul_enabled %}
+            # Consul service discovery
+            consul {
+              upstream {{ upstream_dns }}
+              only_healthy
+              token "{{ consul_token | default('') }}"
+            }
+            {% endif %}
+
+            # File-based zone data
+            file /etc/coredns/db.cluster.local
+
+            # Kubernetes service discovery (if K3s/K8s installed)
+            kubernetes cluster.local in-addr.arpa ip6.arpa {
+              pods insecure
+              upstream {{ upstream_dns }}
+              fallthrough in-addr.arpa ip6.arpa
+            }
+
+            # Error handling
+            errors
+
+            # Forward unknown queries upstream
+            forward . {{ upstream_dns }} {
+              max_concurrent 1000
+            }
+          }
+
+          # Reverse DNS for cluster
+          in-addr.arpa:{{ coredns_port }} {
+            import common
+
+            file /etc/coredns/db.in-addr.arpa
+
+            forward . {{ upstream_dns }}
+          }
+
+          # Metrics endpoint (Prometheus)
+          .:{{ coredns_metrics_port }} {
+            prometheus 0.0.0.0:{{ coredns_metrics_port }}
+          }
+        dest: "{{ coredns_config_dir }}/Corefile"
+        owner: root
+        group: root
+        mode: '0644'
+      register: coredns_config
+
+    - name: Create cluster DNS zone file
+      copy:
+        content: |
+          ; PicoCluster internal DNS zone
+          ; Local cluster services
+
+          $TTL    604800
+          @       IN      SOA     ns.cluster.local. hostmaster.cluster.local. (
+                                  {{ ansible_date_time.unix | int }}  ; Serial
+                                  604800          ; Refresh
+                                  86400           ; Retry
+                                  2419200         ; Expire
+                                  604800 )        ; Minimum TTL
+
+          ; Nameserver
+          @               IN      NS      ns.cluster.local.
+          ns              IN      A       127.0.0.1
+
+          ; Cluster services (add entries as needed)
+          monitoring      IN      A       {{ hostvars[groups.get('monitoring', ['localhost'])[0]].ansible_default_ipv4.address | default('127.0.0.1') }}
+          prometheus      IN      CNAME   monitoring
+          grafana         IN      CNAME   monitoring
+
+          ; Kubernetes services (if K3s installed)
+          kubernetes      IN      A       {{ hostvars[groups.get('monitoring', ['localhost'])[0]].ansible_default_ipv4.address | default('127.0.0.1') }}
+          k3s             IN      CNAME   kubernetes
+
+          ; Cluster nodes
+          {% for node in groups.get('all', []) %}
+          {{ node }}      IN      A       {{ hostvars[node].ansible_default_ipv4.address }}
+          {% endfor %}
+        dest: "{{ coredns_config_dir }}/db.cluster.local"
+        owner: "{{ coredns_user }}"
+        group: "{{ coredns_group }}"
+        mode: '0644'
+      register: coredns_zone
+
+    - name: Create reverse DNS zone file
+      copy:
+        content: |
+          ; Reverse DNS zone for cluster
+          $TTL    604800
+          @       IN      SOA     ns.cluster.local. hostmaster.cluster.local. (
+                                  {{ ansible_date_time.unix | int }}
+                                  604800
+                                  86400
+                                  2419200
+                                  604800 )
+          @       IN      NS      ns.cluster.local.
+        dest: "{{ coredns_config_dir }}/db.in-addr.arpa"
+        owner: "{{ coredns_user }}"
+        group: "{{ coredns_group }}"
+        mode: '0644'
+
+    - name: Create CoreDNS systemd service
+      copy:
+        content: |
+          [Unit]
+          Description=CoreDNS DNS Server
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          Type=simple
+          User={{ coredns_user }}
+          Group={{ coredns_group }}
+          ExecStart=/usr/local/bin/coredns -conf {{ coredns_config_dir }}/Corefile
+          Restart=always
+          RestartSec=5
+
+          # Security
+          NoNewPrivileges=true
+          PrivateTmp=true
+          ProtectSystem=strict
+          ProtectHome=yes
+
+          # Resource limits
+          LimitNOFILE=65536
+          LimitNPROC=512
+
+          SyslogIdentifier=coredns
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/coredns.service
+        owner: root
+        group: root
+        mode: '0644'
+      register: coredns_service
+
+    - name: Enable and start CoreDNS
+      systemd:
+        daemon_reload: yes
+        name: coredns
+        enabled: yes
+        state: restarted
+      when: coredns_service is changed or coredns_config is changed
+
+    - name: Start CoreDNS if not already running
+      systemd:
+        name: coredns
+        state: started
+      changed_when: false
+
+    - name: Wait for CoreDNS to be ready
+      shell: |
+        for i in {1..30}; do
+          if dig @localhost +short cluster.local &>/dev/null; then
+            exit 0
+          fi
+          sleep 1
+        done
+        exit 1
+      retries: 3
+      delay: 2
+      changed_when: false
+
+    - name: Test DNS resolution
+      shell: |
+        dig @localhost monitoring.cluster.local +short
+      register: dns_test
+      changed_when: false
+      ignore_errors: yes
+
+  post_tasks:
+    - name: Display CoreDNS access information
+      debug:
+        msg: |
+          ====== CoreDNS Installation Complete ======
+
+          ✓ CoreDNS installed and running
+          ✓ Listening on 0.0.0.0:{{ coredns_port }}/UDP
+          ✓ Metrics on 0.0.0.0:{{ coredns_metrics_port }}/UDP
+
+          Configuration Files:
+          ─────────────────────────────────────────
+          • Corefile: {{ coredns_config_dir }}/Corefile
+          • Zone DB: {{ coredns_config_dir }}/db.cluster.local
+          • Reverse: {{ coredns_config_dir }}/db.in-addr.arpa
+          • Logs: {{ coredns_log_dir }}/coredns.log
+
+          Testing DNS Resolution:
+          ─────────────────────────────────────────
+          # Query cluster services
+          dig @<node-ip> monitoring.cluster.local +short
+          dig @<node-ip> kubernetes.cluster.local +short
+          dig @<node-ip> prometheus.cluster.local +short
+
+          # Check DNS statistics
+          dig @<node-ip> cluster.local +statistics
+
+          # Lookup specific node
+          dig @<node-ip> pc0.cluster.local +short
+
+          Configure as Cluster DNS:
+          ─────────────────────────────────────────
+          Edit /etc/resolv.conf on all nodes:
+            nameserver {{ ansible_default_ipv4.address }}
+            search cluster.local
+            options ndots:2
+
+          Or use NetworkManager:
+            sudo nmcli connection modify <conn> ipv4.dns "{{ ansible_default_ipv4.address }}"
+            sudo nmcli connection up <conn>
+
+          Monitor DNS Metrics:
+          ─────────────────────────────────────────
+          Prometheus: http://localhost:{{ coredns_metrics_port }}/metrics
+          Grafana: Add as Prometheus datasource
+
+          Service Management:
+          ─────────────────────────────────────────
+          sudo systemctl status coredns
+          sudo systemctl restart coredns
+          sudo journalctl -u coredns -f
+
+          Troubleshooting:
+          ─────────────────────────────────────────
+          # Check if CoreDNS is listening
+          netstat -tlnp | grep coredns
+
+          # Test DNS locally
+          nslookup cluster.local localhost
+          nslookup monitoring.cluster.local localhost
+
+          # View CoreDNS logs
+          journalctl -u coredns -n 50
+
+          # Query with dig
+          dig @localhost cluster.local
+
+          Performance:
+          ─────────────────────────────────────────
+          • Cache TTL: 30s (configurable)
+          • Concurrent queries: 1000
+          • Upstream resolution: {{ upstream_dns }}
+          • Health checking: Enabled
+
+          Integration with Consul:
+          ─────────────────────────────────────────
+          {% if consul_enabled %}
+          ✓ Consul integration enabled
+          ✓ Service discovery from Consul
+          ✓ Health checking with failover
+          {% else %}
+          ✗ Consul integration disabled
+          ✓ Can be enabled by editing Corefile
+          {% endif %}
+
+          ==========================================
+
+    - name: Display DNS test result
+      debug:
+        msg: "DNS Test Result: {{ dns_test.stdout }}"
+      when: dns_test.stdout is defined
+
+    - name: Create DNS configuration summary
+      copy:
+        content: |
+          CoreDNS Configuration Summary
+          Generated: {{ ansible_date_time.iso8601 }}
+
+          Hostname: {{ ansible_hostname }}
+          IP Address: {{ ansible_default_ipv4.address }}
+
+          DNS Configuration:
+          • Cluster Domain: {{ cluster_domain }}
+          • DNS Port: {{ coredns_port }}/UDP
+          • Metrics Port: {{ coredns_metrics_port }}/UDP
+          • Health Check: 8080/TCP
+
+          Zone Files:
+          • {{ coredns_config_dir }}/Corefile
+          • {{ coredns_config_dir }}/db.cluster.local
+          • {{ coredns_config_dir }}/db.in-addr.arpa
+
+          Upstream DNS Servers:
+          {{ upstream_dns }}
+
+          To use this DNS server on cluster nodes:
+          1. Edit /etc/resolv.conf
+          2. Add: nameserver {{ ansible_default_ipv4.address }}
+          3. Add: search {{ cluster_domain }}
+
+          Or use the configure_dns_resolver.sh script
+        dest: "{{ coredns_config_dir }}/CONFIGURATION.txt"
+        owner: root
+        group: root
+        mode: '0644'
