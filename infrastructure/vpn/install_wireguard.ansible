@@ -1,0 +1,509 @@
+---
+# Install and configure WireGuard VPN server for secure cluster access
+#
+# WireGuard provides:
+# - Lightweight modern VPN protocol
+# - Fast encryption using Curve25519, ChaCha20, Poly1305
+# - Minimal attack surface (4000 lines vs 100,000+ for OpenVPN)
+# - Built-in IP address configuration
+# - Automatic key rotation
+# - Better performance on embedded systems
+#
+# Use Cases:
+# - Remote cluster access (management, monitoring, logging)
+# - Inter-node encrypted communication
+# - Secure access to internal services
+# - Site-to-site VPN between clusters
+# - Client VPN for developers/operators
+#
+# Architecture:
+#   VPN Clients ←→ WireGuard Server (UDP 51820) ←→ Cluster Network
+#
+# Default Configuration:
+#   - Interface: wg0
+#   - Port: 51820/UDP
+#   - Network: 10.0.0.0/24 (VPN clients)
+#   - IP: 10.0.0.1/24 (server)
+#   - Routing: Automatic IP forwarding enabled
+#
+# Usage:
+#   # Install on VPN server node
+#   ansible-playbook infrastructure/vpn/install_wireguard.ansible -l vpn-server
+#
+#   # Configure specific VPN network
+#   ansible-playbook infrastructure/vpn/install_wireguard.ansible \
+#     -e vpn_subnet="10.0.0.0/24" \
+#     -e vpn_server_ip="10.0.0.1"
+#
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    wireguard_port: 51820
+    wireguard_interface: "wg0"
+    vpn_subnet: "10.0.0.0/24"
+    vpn_server_ip: "10.0.0.1"
+    vpn_allowed_ips: "10.0.0.0/24"  # What VPN clients can reach through server
+    enable_ipv4_forwarding: true
+    enable_ipv6_forwarding: false
+    dns_servers: "1.1.1.1,1.0.0.1"  # Cloudflare DNS
+
+  pre_tasks:
+    - name: Display WireGuard installation information
+      debug:
+        msg: |
+          ====== WireGuard VPN Server Setup ======
+
+          Protocol: WireGuard (Modern, lightweight VPN)
+          Interface: {{ wireguard_interface }}
+          Port: {{ wireguard_port }}/UDP
+          VPN Network: {{ vpn_subnet }}
+          Server IP: {{ vpn_server_ip }}
+
+          Features:
+          • Modern cryptography (Curve25519, ChaCha20, Poly1305)
+          • Minimal code base (4,000 lines)
+          • Built-in IP management
+          • Automatic key rotation
+          • Stateless design
+          • Per-IP routing policies
+
+          Security:
+          • UDP protocol (stateless)
+          • Private keys protected by wg-quick
+          • Per-peer key rotation
+          • Perfect forward secrecy
+          • No traditional authentication (public key based)
+
+          Use Cases:
+          • Remote cluster management access
+          • Inter-cluster VPN tunnel
+          • Developer/operator secure access
+          • Inter-node encrypted communication
+          • Site-to-site connectivity
+
+          Setup Steps:
+          1. Install WireGuard kernel module and tools
+          2. Generate server keys
+          3. Configure VPN interface
+          4. Enable IP forwarding
+          5. Create firewall rules
+          6. Configure clients (separate playbooks)
+
+          ======================================
+
+  tasks:
+    - name: Install WireGuard and dependencies
+      apt:
+        name:
+          - wireguard
+          - wireguard-tools
+          - linux-headers-generic
+          - qrencode
+        state: present
+        update_cache: yes
+
+    - name: Enable IP forwarding
+      sysctl:
+        name: "{{ item }}"
+        value: "1"
+        sysctl_set: yes
+        state: present
+      with_items:
+        - net.ipv4.ip_forward
+        - net.ipv4.conf.all.forwarding
+      when: enable_ipv4_forwarding
+
+    - name: Enable IPv6 forwarding (optional)
+      sysctl:
+        name: "{{ item }}"
+        value: "1"
+        sysctl_set: yes
+        state: present
+      with_items:
+        - net.ipv6.conf.all.forwarding
+      when: enable_ipv6_forwarding
+
+    - name: Create WireGuard configuration directory
+      file:
+        path: /etc/wireguard
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Generate server private key
+      shell: wg genkey | tee /etc/wireguard/privatekey | wg pubkey > /etc/wireguard/publickey
+      args:
+        creates: /etc/wireguard/privatekey
+
+    - name: Read server private key
+      slurp:
+        src: /etc/wireguard/privatekey
+      register: server_privkey
+
+    - name: Read server public key
+      slurp:
+        src: /etc/wireguard/publickey
+      register: server_pubkey
+
+    - name: Create WireGuard configuration file
+      copy:
+        content: |
+          # WireGuard Server Configuration for PicoCluster
+          # Generated: {{ ansible_date_time.iso8601 }}
+
+          [Interface]
+          # Server VPN IP address
+          Address = {{ vpn_server_ip }}/24
+
+          # Server private key
+          PrivateKey = {{ server_privkey.content | b64decode }}
+
+          # Listen on port and interface
+          ListenPort = {{ wireguard_port }}
+
+          # Firewall rules to allow VPN traffic
+          PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+          PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+          # DNS for VPN clients (optional)
+          # Uncomment to provide DNS to clients
+          # DNS = {{ dns_servers }}
+
+          # Peers are added dynamically using 'wg set' command
+          # See WIREGUARD_SETUP_GUIDE.md for adding clients
+
+        dest: /etc/wireguard/wg0.conf
+        owner: root
+        group: root
+        mode: '0600'
+      register: wg_config
+
+    - name: Enable and start WireGuard
+      systemd:
+        name: wg-quick@wg0
+        enabled: yes
+        state: started
+      register: wg_service
+
+    - name: Wait for WireGuard interface to come up
+      shell: ip link show {{ wireguard_interface }} | grep -q "{{ wireguard_interface }}"
+      retries: 10
+      delay: 1
+      register: wg_check
+      until: wg_check is succeeded
+
+    - name: Check WireGuard status
+      shell: wg show
+      register: wg_status
+      changed_when: false
+
+    - name: Create client key generation script
+      copy:
+        content: |
+          #!/bin/bash
+          # Generate WireGuard client keys and configuration
+
+          set -e
+
+          # Configuration
+          WG_INTERFACE="{{ wireguard_interface }}"
+          VPN_SUBNET="{{ vpn_subnet }}"
+          SERVER_IP="{{ vpn_server_ip }}"
+          SERVER_PORT="{{ wireguard_port }}"
+          SERVER_PUBKEY="{{ server_pubkey.content | b64decode }}"
+          SERVER_HOST="${1:-$(hostname -I | awk '{print $1}')}"  # Use provided host or local IP
+          CLIENT_NAME="${2:-client}"
+          CLIENT_IP="${3:-10.0.0.2}"
+
+          # Create temp directory
+          TEMP_DIR=$(mktemp -d)
+          trap "rm -rf $TEMP_DIR" EXIT
+
+          # Generate client keys
+          CLIENT_PRIVKEY=$(wg genkey)
+          CLIENT_PUBKEY=$(echo "$CLIENT_PRIVKEY" | wg pubkey)
+
+          # Create client config
+          CONFIG_FILE="${TEMP_DIR}/${CLIENT_NAME}.conf"
+
+          cat > "$CONFIG_FILE" << EOF
+          [Interface]
+          # Client name: $CLIENT_NAME
+          # Generated: $(date)
+          Address = ${CLIENT_IP}/32
+          PrivateKey = ${CLIENT_PRIVKEY}
+          DNS = {{ dns_servers }}
+
+          [Peer]
+          # Server
+          PublicKey = ${SERVER_PUBKEY}
+          Endpoint = ${SERVER_HOST}:${SERVER_PORT}
+          AllowedIPs = {{ vpn_allowed_ips }}
+          PersistentKeepalive = 25
+          EOF
+
+          # Add client to server
+          echo "[+] Adding client to WireGuard server..."
+          sudo wg set $WG_INTERFACE peer "$CLIENT_PUBKEY" allowed-ips "${CLIENT_IP}/32"
+
+          # Save configuration
+          echo "[+] Saving server configuration..."
+          sudo wg-quick save $WG_INTERFACE
+
+          # Display client config
+          echo ""
+          echo "====== Client Configuration ======"
+          echo "Client Name: $CLIENT_NAME"
+          echo "Client IP: ${CLIENT_IP}"
+          echo "Client Public Key: $CLIENT_PUBKEY"
+          echo "Client Config File: $CONFIG_FILE"
+          echo ""
+          echo "Configuration content:"
+          cat "$CONFIG_FILE"
+          echo ""
+          echo "====== QR Code ======"
+          qrencode -t ansiutf8 < "$CONFIG_FILE"
+          echo ""
+          echo "====== Instructions ======"
+          echo "1. Copy the configuration file to the client:"
+          echo "   scp $CONFIG_FILE user@client-host:/etc/wireguard/"
+          echo ""
+          echo "2. On client, enable WireGuard:"
+          echo "   sudo systemctl enable wg-quick@${CLIENT_NAME}"
+          echo "   sudo systemctl start wg-quick@${CLIENT_NAME}"
+          echo ""
+          echo "3. Verify connection:"
+          echo "   ping ${SERVER_IP}"
+          echo "   wg show"
+          echo ""
+        dest: /usr/local/bin/wg-gen-client
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create client removal script
+      copy:
+        content: |
+          #!/bin/bash
+          # Remove WireGuard client
+
+          CLIENT_PUBKEY="$1"
+          WG_INTERFACE="{{ wireguard_interface }}"
+
+          if [ -z "$CLIENT_PUBKEY" ]; then
+              echo "Usage: $0 <client-public-key>"
+              echo ""
+              echo "List connected clients:"
+              wg show $WG_INTERFACE peers
+              exit 1
+          fi
+
+          # Remove client
+          sudo wg set $WG_INTERFACE peer "$CLIENT_PUBKEY" remove
+
+          # Save configuration
+          sudo wg-quick save $WG_INTERFACE
+
+          echo "[+] Client removed: $CLIENT_PUBKEY"
+        dest: /usr/local/bin/wg-remove-client
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create WireGuard status script
+      copy:
+        content: |
+          #!/bin/bash
+          # Display WireGuard status
+
+          WG_INTERFACE="{{ wireguard_interface }}"
+
+          echo "====== WireGuard Status ======"
+          echo ""
+          echo "Interface: $WG_INTERFACE"
+          echo "Status: $(systemctl is-active wg-quick@$WG_INTERFACE)"
+          echo ""
+
+          # Show interface details
+          ip address show $WG_INTERFACE
+          echo ""
+
+          # Show peers
+          echo "====== Connected Peers ======"
+          wg show $WG_INTERFACE peers
+
+          if [ $(wg show $WG_INTERFACE peers | wc -l) -eq 0 ]; then
+              echo "No connected peers"
+          else
+              echo ""
+              echo "====== Detailed Peer Information ======"
+              wg show $WG_INTERFACE dump
+          fi
+        dest: /usr/local/bin/wg-status
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create firewall configuration notes
+      copy:
+        content: |
+          # WireGuard Firewall Configuration
+
+          Generated: {{ ansible_date_time.iso8601 }}
+
+          ## UFW (Uncomplicated Firewall)
+
+          Allow WireGuard port:
+          ```
+          sudo ufw allow {{ wireguard_port }}/udp
+          sudo ufw allow from 10.0.0.0/24
+          ```
+
+          ## iptables (Direct)
+
+          Allow WireGuard traffic:
+          ```
+          sudo iptables -A INPUT -p udp --dport {{ wireguard_port }} -j ACCEPT
+          sudo iptables -A FORWARD -i {{ wireguard_interface }} -j ACCEPT
+          sudo iptables -A FORWARD -o {{ wireguard_interface }} -j ACCEPT
+          ```
+
+          ## Firewalld
+
+          Create WireGuard service:
+          ```
+          sudo firewall-cmd --permanent --new-service=wireguard
+          sudo firewall-cmd --permanent --service=wireguard --set-short="WireGuard VPN"
+          sudo firewall-cmd --permanent --service=wireguard --add-port={{ wireguard_port }}/udp
+          sudo firewall-cmd --permanent --add-service=wireguard
+          sudo firewall-cmd --reload
+          ```
+
+          ## Network ACLs / Security Groups (Cloud)
+
+          Allow inbound:
+          - Protocol: UDP
+          - Port: {{ wireguard_port }}
+          - Source: 0.0.0.0/0 (or specific IP ranges)
+
+        dest: /etc/wireguard/FIREWALL_CONFIG.txt
+        owner: root
+        group: root
+        mode: '0644'
+
+  post_tasks:
+    - name: Display WireGuard installation summary
+      debug:
+        msg: |
+          ====== WireGuard Installation Complete ======
+
+          ✓ WireGuard installed and running
+          ✓ Listening on 0.0.0.0:{{ wireguard_port }}/UDP
+          ✓ Server VPN IP: {{ vpn_server_ip }}
+          ✓ VPN Subnet: {{ vpn_subnet }}
+
+          Server Configuration:
+          ─────────────────────────────────────────
+          Interface: {{ wireguard_interface }}
+          Config File: /etc/wireguard/wg0.conf
+          Private Key: /etc/wireguard/privatekey
+          Public Key: /etc/wireguard/publickey
+
+          Service Management:
+          ─────────────────────────────────────────
+          Status: sudo systemctl status wg-quick@{{ wireguard_interface }}
+          Start: sudo systemctl start wg-quick@{{ wireguard_interface }}
+          Stop: sudo systemctl stop wg-quick@{{ wireguard_interface }}
+          Restart: sudo systemctl restart wg-quick@{{ wireguard_interface }}
+          Logs: sudo journalctl -u wg-quick@{{ wireguard_interface }} -f
+
+          Client Management:
+          ─────────────────────────────────────────
+          Generate client config: wg-gen-client <server-ip> <client-name> <client-ip>
+          Example: wg-gen-client 10.1.10.245 laptop 10.0.0.2
+
+          Remove client: wg-remove-client <client-public-key>
+          Check status: wg-status
+
+          Firewall Configuration:
+          ─────────────────────────────────────────
+          Review firewall rules in: /etc/wireguard/FIREWALL_CONFIG.txt
+          Allow UDP {{ wireguard_port }}: sudo ufw allow {{ wireguard_port }}/udp
+          Allow VPN subnet: sudo ufw allow from {{ vpn_subnet }}
+
+          WireGuard Utilities:
+          ─────────────────────────────────────────
+          Show detailed info: sudo wg show
+          Show interface: sudo ip addr show {{ wireguard_interface }}
+          Enable interface: sudo wg-quick up {{ wireguard_interface }}
+          Disable interface: sudo wg-quick down {{ wireguard_interface }}
+
+          Server Credentials:
+          ─────────────────────────────────────────
+          Public Key (share with clients):
+          {{ server_pubkey.content | b64decode }}
+
+          Next Steps:
+          ─────────────────────────────────────────
+          1. Configure firewall rules (see above)
+          2. Generate client configurations:
+             wg-gen-client <your-server-ip> <client-name> <client-ip>
+          3. Distribute client configs to users
+          4. Users install WireGuard and load config
+          5. Verify connectivity: ping {{ vpn_server_ip }}
+
+          For more information:
+          See WIREGUARD_SETUP_GUIDE.md for detailed documentation
+
+          ==========================================
+
+    - name: Create server configuration summary
+      copy:
+        content: |
+          WireGuard VPN Server Configuration
+          Generated: {{ ansible_date_time.iso8601 }}
+
+          Hostname: {{ ansible_hostname }}
+          IP Address: {{ ansible_default_ipv4.address }}
+
+          WireGuard Server:
+          • Interface: {{ wireguard_interface }}
+          • VPN IP: {{ vpn_server_ip }}
+          • VPN Subnet: {{ vpn_subnet }}
+          • Port: {{ wireguard_port }}/UDP
+          • Status: systemctl status wg-quick@{{ wireguard_interface }}
+
+          Key Files:
+          • Private Key: /etc/wireguard/privatekey
+          • Public Key: /etc/wireguard/publickey
+          • Config: /etc/wireguard/wg0.conf
+
+          Client Management:
+          • Generate: wg-gen-client <ip> <name> <vpn-ip>
+          • Remove: wg-remove-client <pubkey>
+          • Status: wg-status
+          • List peers: wg show {{ wireguard_interface }} peers
+
+          IP Forwarding:
+          • IPv4: {% if enable_ipv4_forwarding %}Enabled{% else %}Disabled{% endif %}
+          • IPv6: {% if enable_ipv6_forwarding %}Enabled{% else %}Disabled{% endif %}
+
+          Service Management:
+          • Start: systemctl start wg-quick@{{ wireguard_interface }}
+          • Stop: systemctl stop wg-quick@{{ wireguard_interface }}
+          • Restart: systemctl restart wg-quick@{{ wireguard_interface }}
+          • Logs: journalctl -u wg-quick@{{ wireguard_interface }} -f
+
+          Security:
+          • Firewall rule needed: Allow {{ wireguard_port }}/UDP
+          • Private keys protected with 0700 permissions
+          • No password authentication (public key based)
+
+        dest: /etc/wireguard/CONFIGURATION.txt
+        owner: root
+        group: root
+        mode: '0644'
