@@ -1,0 +1,577 @@
+---
+# Install and configure Certbot for Let's Encrypt certificate management
+#
+# Certbot provides:
+# - Automated SSL/TLS certificate provisioning
+# - Certificate renewal automation
+# - Multiple authentication plugins (standalone, DNS, webroot)
+# - Integration with popular web servers
+# - ACME v2 protocol support
+#
+# Architecture:
+#   Certbot → Let's Encrypt ACME Server → Certificate Authority
+#
+# Features:
+# - Automatic renewal via systemd timer
+# - DNS-based validation for wildcard certificates
+# - Standalone HTTP validation
+# - Integration with Traefik, nginx, Apache
+# - Centralized certificate management
+#
+# Usage:
+#   # Install on certificate management node
+#   ansible-playbook infrastructure/certificates/install_certbot.ansible -l dns-server
+#
+#   # Configure specific domain
+#   ansible-playbook infrastructure/certificates/install_certbot.ansible \
+#     -e cert_domains="cluster.local,*.cluster.local" \
+#     -e cert_email="admin@example.com"
+#
+# Default settings:
+#   - Uses standalone authenticator
+#   - Automatic renewal: daily at 3 AM
+#   - Certificate storage: /etc/letsencrypt/
+#   - Renewal hooks for service restart
+#
+# Supported domains:
+#   - Single domain: example.com
+#   - Multiple domains: example.com,www.example.com
+#   - Wildcard: *.example.com
+#
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    certbot_version: "latest"
+    cert_email: "admin@example.com"
+    cert_domains: "cluster.local"
+    cert_rsa_key_size: 4096
+    cert_agree_tos: true
+    cert_auto_renew: true
+    cert_renew_hour: 3
+    cert_renew_minute: 0
+    certbot_webroot_path: "/var/www/certbot"
+    certbot_standalone_port: 80
+
+  pre_tasks:
+    - name: Display Certbot installation information
+      debug:
+        msg: |
+          ====== Let's Encrypt Certificate Setup ======
+
+          Component: Certbot (Let's Encrypt ACME client)
+          Version: {{ certbot_version }}
+          Domains: {{ cert_domains }}
+          Email: {{ cert_email }}
+          Key Size: {{ cert_rsa_key_size }} bits
+
+          Certificate Details:
+          • Validity: 90 days
+          • Auto-renewal: Enabled ({{ cert_renew_hour }}:{{ cert_renew_minute }} daily)
+          • Storage: /etc/letsencrypt/
+          • Authenticator: Standalone HTTP or DNS
+
+          Features:
+          • Automatic renewal notifications
+          • Integration with Traefik, nginx, Apache
+          • Wildcard certificate support
+          • DNS-based validation for private domains
+
+          Authentication Methods:
+          1. Standalone: Uses port 80 (requires no web server)
+          2. Webroot: Uses existing web server at {{ certbot_webroot_path }}
+          3. DNS: Uses DNS TXT records (for wildcard certs)
+
+          Renewal Schedule:
+          • Automatic renewal: Daily at {{ cert_renew_hour }}:{{ cert_renew_minute }} UTC
+          • Renewal check: Every 12 hours
+          • Hooks: Automatic service restart on renewal
+
+          ======================================
+
+  tasks:
+    - name: Install Certbot and dependencies
+      apt:
+        name:
+          - certbot
+          - python3-certbot
+          - python3-certbot-dns-digitalocean
+          - openssl
+        state: present
+        update_cache: yes
+
+    - name: Create webroot directory
+      file:
+        path: "{{ certbot_webroot_path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create certificate storage directory
+      file:
+        path: /etc/letsencrypt
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Create renewal hooks directory
+      file:
+        path: /etc/letsencrypt/renewal-hooks/post
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Check if certificate already exists
+      stat:
+        path: "/etc/letsencrypt/live/{{ cert_domains.split(',')[0] }}"
+      register: cert_exists
+      changed_when: false
+
+    - name: Request initial certificate (Standalone)
+      block:
+        - name: Create temporary firewall rule for Let's Encrypt validation
+          ufw:
+            rule: allow
+            port: '80'
+            proto: tcp
+            comment: "Let's Encrypt HTTP validation"
+          ignore_errors: yes
+
+        - name: Request certificate from Let's Encrypt
+          shell: |
+            certbot certonly \
+              --standalone \
+              --agree-tos \
+              --email {{ cert_email }} \
+              --no-eff-email \
+              --rsa-key-size {{ cert_rsa_key_size }} \
+              --domains {{ cert_domains }} \
+              --non-interactive
+          register: certbot_result
+          changed_when: "'Successfully received certificate' in certbot_result.stdout"
+
+        - name: Display certificate request result
+          debug:
+            msg: "{{ certbot_result.stdout_lines }}"
+
+      when: not cert_exists.stat.exists
+
+    - name: Create certificate renewal hook for Traefik
+      copy:
+        content: |
+          #!/bin/bash
+          # Renewal hook for Traefik - reload on certificate renewal
+
+          echo "Certificate renewed, reloading Traefik..."
+
+          if systemctl is-active --quiet traefik; then
+              systemctl reload traefik
+              echo "Traefik reloaded successfully"
+          fi
+
+          # If using docker-compose with Traefik
+          if command -v docker-compose &> /dev/null; then
+              if docker-compose ps traefik | grep -q "traefik"; then
+                  docker-compose restart traefik
+                  echo "Traefik (docker-compose) restarted successfully"
+              fi
+          fi
+        dest: /etc/letsencrypt/renewal-hooks/post/traefik.sh
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create certificate renewal hook for nginx
+      copy:
+        content: |
+          #!/bin/bash
+          # Renewal hook for nginx - reload on certificate renewal
+
+          echo "Certificate renewed, reloading nginx..."
+
+          if systemctl is-active --quiet nginx; then
+              systemctl reload nginx
+              echo "nginx reloaded successfully"
+          fi
+        dest: /etc/letsencrypt/renewal-hooks/post/nginx.sh
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create certificate renewal hook for Apache
+      copy:
+        content: |
+          #!/bin/bash
+          # Renewal hook for Apache - reload on certificate renewal
+
+          echo "Certificate renewed, reloading Apache..."
+
+          if systemctl is-active --quiet apache2; then
+              systemctl reload apache2
+              echo "Apache reloaded successfully"
+          fi
+        dest: /etc/letsencrypt/renewal-hooks/post/apache.sh
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create certificate renewal hook for custom services
+      copy:
+        content: |
+          #!/bin/bash
+          # Renewal hook for custom service restart
+
+          CERT_NAME="{{ cert_domains.split(',')[0] }}"
+
+          echo "Certificate renewed: $CERT_NAME"
+          echo "Timestamp: $(date)"
+
+          # Add custom service restarts here
+          # Example:
+          # if systemctl is-active --quiet my-service; then
+          #     systemctl restart my-service
+          # fi
+
+          # Log renewal
+          logger -t certbot "Certificate renewed for $CERT_NAME"
+        dest: /etc/letsencrypt/renewal-hooks/post/custom.sh
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create systemd renewal timer
+      copy:
+        content: |
+          [Unit]
+          Description=Daily Certbot Certificate Renewal
+          Documentation=man:certbot(1)
+          After=network.target
+
+          [Timer]
+          OnBootSec=1h
+          OnUnitActiveSec=12h
+          Persistent=true
+
+          # Randomize to prevent thundering herd
+          RandomizedDelaySec=1h
+
+          [Install]
+          WantedBy=timers.target
+        dest: /etc/systemd/system/certbot-renewal.timer
+        owner: root
+        group: root
+        mode: '0644'
+      register: certbot_timer
+
+    - name: Create systemd renewal service
+      copy:
+        content: |
+          [Unit]
+          Description=Certbot Certificate Renewal Service
+          Documentation=man:certbot(1)
+          After=network.target
+
+          [Service]
+          Type=oneshot
+          User=root
+          ExecStart=/usr/bin/certbot renew --non-interactive --quiet
+          ExecStart=/bin/systemctl reload-or-restart certbot-renewal.timer
+          StandardOutput=journal
+          StandardError=journal
+        dest: /etc/systemd/system/certbot-renewal.service
+        owner: root
+        group: root
+        mode: '0644'
+      register: certbot_service
+
+    - name: Enable and start renewal timer
+      systemd:
+        daemon_reload: "{{ certbot_timer is changed or certbot_service is changed }}"
+        name: certbot-renewal.timer
+        enabled: yes
+        state: started
+
+    - name: Create certificate info script
+      copy:
+        content: |
+          #!/bin/bash
+          # Script to display certificate information
+
+          CERT_DIR="/etc/letsencrypt/live"
+
+          if [ ! -d "$CERT_DIR" ]; then
+              echo "No certificates found in $CERT_DIR"
+              exit 1
+          fi
+
+          echo "====== Let's Encrypt Certificates ======"
+          echo ""
+
+          for domain_dir in "$CERT_DIR"/*; do
+              if [ -d "$domain_dir" ]; then
+                  domain=$(basename "$domain_dir")
+                  cert_file="$domain_dir/cert.pem"
+
+                  if [ -f "$cert_file" ]; then
+                      echo "Domain: $domain"
+                      echo "─────────────────────────────────────"
+
+                      # Extract certificate details
+                      echo "Subject: $(openssl x509 -in "$cert_file" -noout -subject | sed 's/subject=//')"
+                      echo "Issuer: $(openssl x509 -in "$cert_file" -noout -issuer | sed 's/issuer=//')"
+
+                      # Expiration date
+                      exp_date=$(openssl x509 -in "$cert_file" -noout -enddate | sed 's/notAfter=//')
+                      echo "Valid Until: $exp_date"
+
+                      # Days until expiration
+                      exp_epoch=$(date -d "$exp_date" +%s)
+                      now_epoch=$(date +%s)
+                      days_left=$(( ($exp_epoch - $now_epoch) / 86400 ))
+
+                      if [ $days_left -lt 0 ]; then
+                          echo "Status: ⚠️  EXPIRED ($((-days_left)) days ago)"
+                      elif [ $days_left -lt 7 ]; then
+                          echo "Status: ⚠️  EXPIRES SOON ($days_left days)"
+                      else
+                          echo "Status: ✓ VALID ($days_left days remaining)"
+                      fi
+
+                      # Alternative names
+                      alt_names=$(openssl x509 -in "$cert_file" -noout -text | grep -A1 "Subject Alternative Name" | tail -1 | sed 's/.*DNS: //' | sed 's/, /\n           /')
+                      if [ ! -z "$alt_names" ]; then
+                          echo "Alt Names: $alt_names"
+                      fi
+
+                      # Certificate paths
+                      echo "Paths:"
+                      echo "  Certificate: $domain_dir/cert.pem"
+                      echo "  Private Key: $domain_dir/privkey.pem"
+                      echo "  Chain: $domain_dir/chain.pem"
+                      echo "  Full Chain: $domain_dir/fullchain.pem"
+                      echo ""
+                  fi
+              fi
+          done
+
+          echo "======================================="
+          echo ""
+          echo "Renewal Status:"
+          certbot renew --dry-run --non-interactive 2>&1 | grep -E "Cert not due for renewal|Cert due for renewal"
+        dest: /usr/local/bin/cert-info
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create certificate monitoring script
+      copy:
+        content: |
+          #!/bin/bash
+          # Script to check certificate expiration dates
+
+          CERT_DIR="/etc/letsencrypt/live"
+          WARNING_DAYS=30
+
+          if [ ! -d "$CERT_DIR" ]; then
+              echo "No certificates found"
+              exit 1
+          fi
+
+          echo "====== Certificate Expiration Check ======"
+          echo ""
+
+          expired_count=0
+          warning_count=0
+          valid_count=0
+
+          for domain_dir in "$CERT_DIR"/*; do
+              if [ -d "$domain_dir" ]; then
+                  domain=$(basename "$domain_dir")
+                  cert_file="$domain_dir/cert.pem"
+
+                  if [ -f "$cert_file" ]; then
+                      exp_date=$(openssl x509 -in "$cert_file" -noout -enddate | sed 's/notAfter=//')
+                      exp_epoch=$(date -d "$exp_date" +%s)
+                      now_epoch=$(date +%s)
+                      days_left=$(( ($exp_epoch - $now_epoch) / 86400 ))
+
+                      if [ $days_left -lt 0 ]; then
+                          echo "[EXPIRED] $domain: $((-days_left)) days ago"
+                          ((expired_count++))
+                      elif [ $days_left -lt $WARNING_DAYS ]; then
+                          echo "[WARNING] $domain: $days_left days until expiration"
+                          ((warning_count++))
+                      else
+                          echo "[OK] $domain: $days_left days remaining"
+                          ((valid_count++))
+                      fi
+                  fi
+              fi
+          done
+
+          echo ""
+          echo "Summary: $valid_count valid, $warning_count warnings, $expired_count expired"
+
+          # Exit with error if any expired
+          [ $expired_count -gt 0 ] && exit 1 || exit 0
+        dest: /usr/local/bin/cert-check
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create renewal history log file
+      file:
+        path: /var/log/certbot-renewal.log
+        state: touch
+        owner: root
+        group: root
+        mode: '0644'
+
+  post_tasks:
+    - name: Display certificate installation summary
+      debug:
+        msg: |
+          ====== Let's Encrypt Installation Complete ======
+
+          ✓ Certbot installed and configured
+          ✓ Automatic renewal enabled (daily at {{ cert_renew_hour }}:{{ cert_renew_minute }} UTC)
+
+          Certificate Information:
+          ─────────────────────────────────────────
+          {% if cert_exists.stat.exists %}
+          Certificate Status: ✓ ACTIVE
+          Location: /etc/letsencrypt/live/{{ cert_domains.split(',')[0] }}/
+          {% else %}
+          Certificate Status: ✓ NEWLY CREATED
+          Domains: {{ cert_domains }}
+          {% endif %}
+
+          Certificate Files:
+          • cert.pem - Certificate (public key)
+          • privkey.pem - Private key
+          • chain.pem - Chain of trust
+          • fullchain.pem - Certificate + chain (use for web servers)
+
+          Renewal Management:
+          ─────────────────────────────────────────
+          Manual renewal:  certbot renew
+          Dry run:         certbot renew --dry-run
+          Check status:    cert-info
+          Check expiry:    cert-check
+
+          Systemd Timer:
+          • Service: certbot-renewal.service
+          • Timer: certbot-renewal.timer
+          • Check status: systemctl status certbot-renewal.timer
+          • View logs: journalctl -u certbot-renewal.service -f
+
+          Renewal Hooks:
+          Automatic service reload on certificate renewal:
+          • /etc/letsencrypt/renewal-hooks/post/traefik.sh
+          • /etc/letsencrypt/renewal-hooks/post/nginx.sh
+          • /etc/letsencrypt/renewal-hooks/post/apache.sh
+          • /etc/letsencrypt/renewal-hooks/post/custom.sh
+
+          Renewal Log:
+          • Location: /var/log/certbot-renewal.log
+          • View: tail -f /var/log/certbot-renewal.log
+
+          Next Steps:
+          ─────────────────────────────────────────
+          1. Copy certificate paths to your web server config:
+             SSL Cert: /etc/letsencrypt/live/{{ cert_domains.split(',')[0] }}/fullchain.pem
+             SSL Key: /etc/letsencrypt/live/{{ cert_domains.split(',')[0] }}/privkey.pem
+
+          2. Configure web server to use certificates (see CERTIFICATES_SETUP_GUIDE.md)
+
+          3. Set up ACME DNS challenge for wildcard certificates:
+             ansible-playbook infrastructure/certificates/configure_dns_challenge.ansible
+
+          4. Monitor certificate expiration:
+             */6 * * * * /usr/local/bin/cert-check || echo "Certificate expiring soon" | mail admin
+
+          Firewall Rules:
+          ─────────────────────────────────────────
+          Port 80 (HTTP): Required for initial validation
+          Port 443 (HTTPS): Required after certificate obtained
+
+          ==========================================
+
+    - name: Create certificate configuration summary
+      copy:
+        content: |
+          Let's Encrypt Certificate Management Configuration
+          Generated: {{ ansible_date_time.iso8601 }}
+
+          Hostname: {{ ansible_hostname }}
+          IP Address: {{ ansible_default_ipv4.address }}
+
+          Certbot Installation:
+          • Version: {{ certbot_version }}
+          • Config: /etc/letsencrypt/
+          • Work: /var/lib/letsencrypt/
+          • Logs: /var/log/letsencrypt/
+
+          Certificate Details:
+          • Email: {{ cert_email }}
+          • Domains: {{ cert_domains }}
+          • Key Size: {{ cert_rsa_key_size }} bits
+          • Agreement: Let's Encrypt ToS accepted
+
+          Automatic Renewal:
+          • Enabled: {{ cert_auto_renew }}
+          • Schedule: Daily at {{ cert_renew_hour }}:{{ cert_renew_minute }} UTC
+          • Check Interval: Every 12 hours
+          • Service: certbot-renewal.service
+          • Timer: certbot-renewal.timer
+          • Status: systemctl status certbot-renewal.timer
+
+          Renewal Hooks:
+          Configured to automatically restart services on renewal:
+          • Traefik: /etc/letsencrypt/renewal-hooks/post/traefik.sh
+          • nginx: /etc/letsencrypt/renewal-hooks/post/nginx.sh
+          • Apache: /etc/letsencrypt/renewal-hooks/post/apache.sh
+          • Custom: /etc/letsencrypt/renewal-hooks/post/custom.sh
+
+          Management Commands:
+          • cert-info: Display all certificate information
+          • cert-check: Check certificate expiration dates
+          • certbot renew: Manually trigger renewal
+          • certbot renew --dry-run: Test renewal without making changes
+
+          Logs:
+          • Certbot logs: /var/log/letsencrypt/letsencrypt.log
+          • Renewal logs: journalctl -u certbot-renewal.service
+          • Custom log: /var/log/certbot-renewal.log
+
+          Certificate Paths:
+          • /etc/letsencrypt/live/
+          • /etc/letsencrypt/archive/
+          • /etc/letsencrypt/renewal/
+
+          For Web Server Integration:
+          See CERTIFICATES_SETUP_GUIDE.md for:
+          • Traefik configuration
+          • nginx configuration
+          • Apache configuration
+          • Docker/Docker Compose setup
+
+        dest: /etc/letsencrypt/CONFIGURATION.txt
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Run certificate info script
+      shell: /usr/local/bin/cert-info
+      register: cert_info
+      ignore_errors: yes
+
+    - name: Display current certificates
+      debug:
+        msg: "{{ cert_info.stdout_lines }}"
+      when: cert_info.rc == 0

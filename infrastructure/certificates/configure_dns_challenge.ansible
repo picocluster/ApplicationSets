@@ -1,0 +1,354 @@
+---
+# Configure DNS challenge for Let's Encrypt wildcard certificates
+#
+# DNS challenges allow requesting wildcard certificates (* .example.com)
+# by proving domain ownership via DNS TXT records.
+#
+# Supports multiple DNS providers:
+# - Digital Ocean
+# - Route 53 (AWS)
+# - CloudFlare
+# - Google Cloud DNS
+# - Azure DNS
+#
+# Usage:
+#   # Configure for wildcard certificate
+#   ansible-playbook infrastructure/certificates/configure_dns_challenge.ansible \
+#     -e dns_provider="digitalocean" \
+#     -e dns_api_token="your-api-token" \
+#     -e cert_domain="example.com"
+#
+#   # List available providers
+#   cat /etc/certbot/dns-providers.txt
+#
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    cert_domain: "example.com"
+    dns_provider: "digitalocean"  # digitalocean, route53, cloudflare, gcloud, azure
+    dns_api_token: ""             # API token for the DNS provider
+    certbot_dns_dir: "/etc/certbot"
+    certbot_archive_dir: "/etc/certbot/dns-provider-configs"
+
+  pre_tasks:
+    - name: Display DNS challenge configuration information
+      debug:
+        msg: |
+          ====== DNS Challenge Configuration ======
+
+          Provider: {{ dns_provider }}
+          Domain: {{ cert_domain }}
+          Wildcard: *.{{ cert_domain }}
+
+          DNS Challenge Process:
+          1. Certbot validates domain ownership via DNS
+          2. Creates TXT record in DNS zone
+          3. Let's Encrypt verifies TXT record
+          4. Certificate issued for wildcard domain
+
+          Supported Providers:
+          • digitalocean - DigitalOcean Domains
+          • route53 - AWS Route 53
+          • cloudflare - CloudFlare
+          • gcloud - Google Cloud DNS
+          • azure - Azure DNS
+
+          ======================================
+
+  tasks:
+    - name: Create DNS provider config directory
+      file:
+        path: "{{ certbot_archive_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0700'
+
+    - name: Configure DigitalOcean DNS challenge
+      block:
+        - name: Create DigitalOcean credentials file
+          copy:
+            content: |
+              # DigitalOcean API credentials for Certbot DNS challenge
+              dns_digitalocean_token = {{ dns_api_token }}
+            dest: "{{ certbot_dns_dir }}/dns-digitalocean.ini"
+            owner: root
+            group: root
+            mode: '0600'
+
+        - name: Store DigitalOcean credentials backup
+          copy:
+            src: "{{ certbot_dns_dir }}/dns-digitalocean.ini"
+            dest: "{{ certbot_archive_dir }}/dns-digitalocean.ini.bak"
+            remote_src: yes
+            owner: root
+            group: root
+            mode: '0600'
+
+      when: dns_provider == "digitalocean" and dns_api_token != ""
+
+    - name: Configure Route 53 DNS challenge
+      block:
+        - name: Create Route 53 credentials file
+          copy:
+            content: |
+              # AWS Route 53 credentials for Certbot DNS challenge
+              dns_aws_access_key_id = {{ dns_api_token.split(':')[0] | default('') }}
+              dns_aws_secret_access_key = {{ dns_api_token.split(':')[1] | default('') }}
+            dest: "{{ certbot_dns_dir }}/dns-route53.ini"
+            owner: root
+            group: root
+            mode: '0600'
+
+        - name: Store Route 53 credentials backup
+          copy:
+            src: "{{ certbot_dns_dir }}/dns-route53.ini"
+            dest: "{{ certbot_archive_dir }}/dns-route53.ini.bak"
+            remote_src: yes
+            owner: root
+            group: root
+            mode: '0600'
+
+      when: dns_provider == "route53" and dns_api_token != ""
+
+    - name: Configure CloudFlare DNS challenge
+      block:
+        - name: Create CloudFlare credentials file
+          copy:
+            content: |
+              # CloudFlare credentials for Certbot DNS challenge
+              dns_cloudflare_api_token = {{ dns_api_token }}
+            dest: "{{ certbot_dns_dir }}/dns-cloudflare.ini"
+            owner: root
+            group: root
+            mode: '0600'
+
+        - name: Store CloudFlare credentials backup
+          copy:
+            src: "{{ certbot_dns_dir }}/dns-cloudflare.ini"
+            dest: "{{ certbot_archive_dir }}/dns-cloudflare.ini.bak"
+            remote_src: yes
+            owner: root
+            group: root
+            mode: '0600'
+
+      when: dns_provider == "cloudflare" and dns_api_token != ""
+
+    - name: Configure Google Cloud DNS challenge
+      block:
+        - name: Create Google Cloud DNS credentials file
+          copy:
+            content: |
+              # Google Cloud DNS credentials for Certbot DNS challenge
+              # This should be the path to your service account JSON key
+              dns_gcloud_project_id = {{ dns_api_token }}
+            dest: "{{ certbot_dns_dir }}/dns-gcloud.ini"
+            owner: root
+            group: root
+            mode: '0600'
+
+        - name: Store Google Cloud DNS credentials backup
+          copy:
+            src: "{{ certbot_dns_dir }}/dns-gcloud.ini"
+            dest: "{{ certbot_archive_dir }}/dns-gcloud.ini.bak"
+            remote_src: yes
+            owner: root
+            group: root
+            mode: '0600'
+
+      when: dns_provider == "gcloud" and dns_api_token != ""
+
+    - name: Configure Azure DNS challenge
+      block:
+        - name: Create Azure DNS credentials file
+          copy:
+            content: |
+              # Azure DNS credentials for Certbot DNS challenge
+              dns_azure_client_id = {{ dns_api_token.split(':')[0] | default('') }}
+              dns_azure_client_secret = {{ dns_api_token.split(':')[1] | default('') }}
+              dns_azure_subscription_id = {{ dns_api_token.split(':')[2] | default('') }}
+              dns_azure_tenant_id = {{ dns_api_token.split(':')[3] | default('') }}
+              dns_azure_resource_group = {{ dns_api_token.split(':')[4] | default('') }}
+            dest: "{{ certbot_dns_dir }}/dns-azure.ini"
+            owner: root
+            group: root
+            mode: '0600'
+
+        - name: Store Azure DNS credentials backup
+          copy:
+            src: "{{ certbot_dns_dir }}/dns-azure.ini"
+            dest: "{{ certbot_archive_dir }}/dns-azure.ini.bak"
+            remote_src: yes
+            owner: root
+            group: root
+            mode: '0600'
+
+      when: dns_provider == "azure" and dns_api_token != ""
+
+    - name: Request wildcard certificate with DNS challenge (DigitalOcean)
+      shell: |
+        certbot certonly \
+          --dns-digitalocean \
+          --dns-digitalocean-credentials {{ certbot_dns_dir }}/dns-digitalocean.ini \
+          --agree-tos \
+          --email admin@{{ cert_domain }} \
+          --no-eff-email \
+          --rsa-key-size 4096 \
+          --domains {{ cert_domain }},*.{{ cert_domain }} \
+          --non-interactive
+      when: dns_provider == "digitalocean" and dns_api_token != ""
+      register: wildcard_cert_result
+
+    - name: Request wildcard certificate with DNS challenge (Route 53)
+      shell: |
+        certbot certonly \
+          --dns-route53 \
+          --agree-tos \
+          --email admin@{{ cert_domain }} \
+          --no-eff-email \
+          --rsa-key-size 4096 \
+          --domains {{ cert_domain }},*.{{ cert_domain }} \
+          --non-interactive
+      when: dns_provider == "route53" and dns_api_token != ""
+      register: wildcard_cert_result
+
+    - name: Request wildcard certificate with DNS challenge (CloudFlare)
+      shell: |
+        certbot certonly \
+          --dns-cloudflare \
+          --dns-cloudflare-credentials {{ certbot_dns_dir }}/dns-cloudflare.ini \
+          --agree-tos \
+          --email admin@{{ cert_domain }} \
+          --no-eff-email \
+          --rsa-key-size 4096 \
+          --domains {{ cert_domain }},*.{{ cert_domain }} \
+          --non-interactive
+      when: dns_provider == "cloudflare" and dns_api_token != ""
+      register: wildcard_cert_result
+
+    - name: Create DNS challenge documentation
+      copy:
+        content: |
+          # DNS Challenge Configuration
+          Generated: {{ ansible_date_time.iso8601 }}
+
+          Provider: {{ dns_provider }}
+          Domain: {{ cert_domain }}
+          Wildcard Domain: *.{{ cert_domain }}
+
+          ## Configured DNS Provider: {{ dns_provider }}
+
+          ### Credentials Location:
+          - Config: {{ certbot_dns_dir }}/dns-{{ dns_provider }}.ini
+          - Backup: {{ certbot_archive_dir }}/dns-{{ dns_provider }}.ini.bak
+
+          ### Verify Configuration:
+          ```bash
+          cat {{ certbot_dns_dir }}/dns-{{ dns_provider }}.ini
+          ```
+
+          ### Certificate Details:
+          Certificate Location: /etc/letsencrypt/live/{{ cert_domain }}/
+
+          Files:
+          - cert.pem
+          - privkey.pem
+          - fullchain.pem
+          - chain.pem
+
+          ### Renew Wildcard Certificate:
+          ```bash
+          certbot renew --dns-{{ dns_provider }} --dns-{{ dns_provider }}-credentials {{ certbot_dns_dir }}/dns-{{ dns_provider }}.ini
+          ```
+
+          ### Check Certificate:
+          ```bash
+          openssl x509 -in /etc/letsencrypt/live/{{ cert_domain }}/cert.pem -text -noout
+          ```
+
+          ### DNS Verification:
+          Let's Encrypt validates domain ownership by checking DNS TXT records.
+          During renewal, Certbot will automatically:
+          1. Create temporary TXT record in DNS zone
+          2. Wait for propagation
+          3. Verify with Let's Encrypt
+          4. Delete temporary TXT record
+
+        dest: "{{ certbot_dns_dir }}/dns-challenge-README.txt"
+        owner: root
+        group: root
+        mode: '0644'
+
+  post_tasks:
+    - name: Display DNS challenge configuration summary
+      debug:
+        msg: |
+          ====== DNS Challenge Configuration Complete ======
+
+          Provider: {{ dns_provider }}
+          Domain: {{ cert_domain }}
+          Wildcard: *.{{ cert_domain }}
+
+          Configuration Files:
+          ─────────────────────────────────────────
+          Credentials: {{ certbot_dns_dir }}/dns-{{ dns_provider }}.ini
+          Backup: {{ certbot_archive_dir }}/dns-{{ dns_provider }}.ini.bak
+          Documentation: {{ certbot_dns_dir }}/dns-challenge-README.txt
+
+          Next Steps:
+          ─────────────────────────────────────────
+          1. Verify credentials are correct:
+             cat {{ certbot_dns_dir }}/dns-{{ dns_provider }}.ini
+
+          2. Check certificate status:
+             cert-info
+
+          3. For automatic renewal with DNS challenge:
+             Edit renewal hook to include DNS challenge:
+             certbot renew --dns-{{ dns_provider }} \\
+               --dns-{{ dns_provider }}-credentials {{ certbot_dns_dir }}/dns-{{ dns_provider }}.ini
+
+          4. Update Traefik/web server to use wildcard certificate:
+             cert_file: /etc/letsencrypt/live/{{ cert_domain }}/fullchain.pem
+             key_file: /etc/letsencrypt/live/{{ cert_domain }}/privkey.pem
+
+          Provider-Specific Notes:
+          ─────────────────────────────────────────
+          {% if dns_provider == "digitalocean" %}
+          DigitalOcean:
+          • API Token from: https://cloud.digitalocean.com/account/api/tokens
+          • Requires read/write access to Domains
+          • Automatic propagation check
+          {% elif dns_provider == "route53" %}
+          Route 53:
+          • Requires AWS credentials (Access Key + Secret Key)
+          • IAM policy must allow Route53 DNS changes
+          • Can use instance IAM roles for EC2
+          {% elif dns_provider == "cloudflare" %}
+          CloudFlare:
+          • API Token from: https://dash.cloudflare.com/profile/api-tokens
+          • Create token with Zone:DNS:Edit scope
+          • Supports all CloudFlare zones
+          {% elif dns_provider == "gcloud" %}
+          Google Cloud:
+          • Use service account JSON key
+          • Requires roles/dns.admin IAM role
+          • Project ID must have DNS zones configured
+          {% elif dns_provider == "azure" %}
+          Azure:
+          • Requires service principal credentials
+          • Must have Contributor role on DNS zone resource group
+          • Subscription ID needed for authentication
+          {% endif %}
+
+          ==========================================
+
+    - name: Store configuration in Ansible facts
+      lineinfile:
+        path: /etc/environment
+        line: "CERTBOT_DNS_PROVIDER={{ dns_provider }}"
+        create: yes
+      ignore_errors: yes
