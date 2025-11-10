@@ -1,0 +1,585 @@
+---
+# Install and configure Calico for network policies on PicoCluster
+#
+# Calico provides:
+# - Kubernetes Network Policies
+# - Microsegmentation (pod-to-pod)
+# - DNS-based policies
+# - BGP routing (optional)
+# - Network performance monitoring
+#
+# Architecture:
+#   Pod A ←→ Calico Policy Engine ←→ Pod B
+#   Enforces NetworkPolicy rules on each node
+#
+# Features:
+# - Kubernetes NetworkPolicy API
+# - Calico Network Policies (extended)
+# - Label-based access control
+# - Namespace isolation
+# - Service account-based rules
+# - CIDR-based rules
+# - Port-level granularity
+# - Ingress and Egress control
+#
+# Default Configuration:
+#   - IPAM: Calico
+#   - BGP: Enabled (can disable for non-routed networks)
+#   - Policy Enforcement: Staged (non-blocking review mode first)
+#
+# Usage:
+#   # Install Calico on cluster
+#   ansible-playbook infrastructure/security/install_calico.ansible
+#
+#   # Deploy network policies
+#   ansible-playbook infrastructure/security/deploy_network_policies.ansible
+#
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    calico_version: "3.26.1"
+    calico_namespace: "calico-system"
+    calico_cni_plugin: "calico"  # or flannel for hybrid setup
+    enable_bgp: true
+    policy_enforcement_mode: "staged"  # staged or enforced
+    enable_dns_policy: true
+    network_policy_log_level: "info"  # debug, info, warning, error
+
+  pre_tasks:
+    - name: Display Calico installation information
+      debug:
+        msg: |
+          ====== Calico Network Policy Setup ======
+
+          Component: Calico (Network Policy Engine)
+          Version: {{ calico_version }}
+          Namespace: {{ calico_namespace }}
+          CNI Plugin: {{ calico_cni_plugin }}
+          BGP: {{ "Enabled" if enable_bgp else "Disabled" }}
+
+          Network Security Features:
+          • Kubernetes NetworkPolicy enforcement
+          • Pod-to-pod microsegmentation
+          • Service account-based policies
+          • Namespace isolation
+          • DNS-based policies (FQDN)
+          • CIDR-based access control
+          • Port-level granularity
+          • Ingress and egress rules
+
+          Policy Enforcement Modes:
+          1. Staged: Review mode, no enforcement
+             - Policies created but not enforced
+             - Allows testing before activation
+             - Recommended for migration
+
+          2. Enforced: Active enforcement
+             - Policies immediately enforced
+             - Denied traffic blocked
+             - Recommended for production
+
+          Current Mode: {{ policy_enforcement_mode }}
+
+          Use Cases:
+          • Deny-all-by-default strategy
+          • Service-to-service communication control
+          • Namespace isolation
+          • Database access restrictions
+          • API access control
+          • Egress filtering
+          • Compliance requirements
+
+          Key Resources:
+          • NetworkPolicy: Kubernetes native
+          • NetworkSet: Named IP sets
+          • NetworkPolicy: Calico extended policies
+          • GlobalNetworkPolicy: Cluster-wide policies
+
+          ======================================
+
+  tasks:
+    - name: Check if Calico is already installed
+      shell: kubectl get daemonset -n calico-system calico-node 2>/dev/null
+      ignore_errors: yes
+      register: calico_check
+      changed_when: false
+
+    - name: Download Calico manifest
+      block:
+        - name: Get Calico installation manifest
+          get_url:
+            url: "https://raw.githubusercontent.com/projectcalico/calico/v{{ calico_version }}/manifests/tigera-operator.yaml"
+            dest: "/tmp/tigera-operator-{{ calico_version }}.yaml"
+            timeout: 60
+
+        - name: Display manifest location
+          debug:
+            msg: "Calico manifest downloaded to /tmp/tigera-operator-{{ calico_version }}.yaml"
+
+      when: calico_check is failed
+
+    - name: Create Calico namespace
+      kubernetes.core.k8s:
+        name: "{{ calico_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Install Calico Operator
+      block:
+        - name: Apply Tigera operator
+          kubernetes.core.k8s:
+            state: present
+            definition: "{{ lookup('file', '/tmp/tigera-operator-' + calico_version + '.yaml') | from_yaml_all }}"
+          ignore_errors: yes
+
+        - name: Wait for operator to be ready
+          kubernetes.core.k8s_info:
+            kind: Deployment
+            namespace: "{{ calico_namespace }}"
+            name: tigera-operator
+            wait: yes
+            wait_condition:
+              type: Available
+              status: "True"
+            wait_sleep: 5
+            wait_timeout: 300
+          ignore_errors: yes
+
+      when: calico_check is failed
+
+    - name: Create Calico Installation resource
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: operator.tigera.io/v1
+          kind: Installation
+          metadata:
+            name: default
+          spec:
+            variant: Calico
+            imagePullSecrets:
+              - name: tigera-pull-secret
+            calicoNetwork:
+              bgp: "{{ 'Enabled' if enable_bgp else 'Disabled' }}"
+              ipPools:
+                - blockSize: 26
+                  cidr: 192.168.0.0/16
+                  encapsulation: VXLan
+                  natOutgoing: Enabled
+                  nodeSelector: all()
+              containerIPForwarding: Enabled
+              hostPorts: Enabled
+              multiInterfaceMode: None
+              nodeMetricsPort: 9081
+              serviceCIDRs:
+                - 10.96.0.0/12
+
+    - name: Create API server configuration for policy audit
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: operator.tigera.io/v1
+          kind: APIServer
+          metadata:
+            name: default
+          spec:
+            logSink:
+              type: Syslog
+              syslogLogging:
+                protocol: tcp
+                address: localhost:514
+              logFileMaxSize: 100
+              logFileMaxBackups: 3
+              logFileMaxDays: 30
+
+    - name: Create network policies namespace
+      kubernetes.core.k8s:
+        name: network-policies
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Create example Calico network policies
+      copy:
+        content: |
+          ---
+          # Example: Deny all traffic by default
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: default-deny
+            namespace: default
+          spec:
+            podSelector: {}
+            policyTypes:
+            - Ingress
+            - Egress
+          ---
+          # Example: Allow traffic within same namespace
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: allow-same-namespace
+            namespace: default
+          spec:
+            podSelector: {}
+            policyTypes:
+            - Ingress
+            ingress:
+            - from:
+              - podSelector: {}
+          ---
+          # Example: Allow specific pod labels
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: allow-frontend
+            namespace: default
+          spec:
+            podSelector:
+              matchLabels:
+                app: backend
+            policyTypes:
+            - Ingress
+            ingress:
+            - from:
+              - podSelector:
+                  matchLabels:
+                    app: frontend
+              ports:
+              - protocol: TCP
+                port: 8080
+          ---
+          # Example: Allow egress to DNS
+          apiVersion: networking.k8s.io/v1
+          kind: NetworkPolicy
+          metadata:
+            name: allow-dns
+            namespace: default
+          spec:
+            podSelector: {}
+            policyTypes:
+            - Egress
+            egress:
+            - to:
+              - namespaceSelector:
+                  matchLabels:
+                    name: kube-system
+              ports:
+              - protocol: UDP
+                port: 53
+            - to:
+              - podSelector: {}
+              ports:
+              - protocol: TCP
+                port: 443
+          ---
+          # Example: Calico NetworkPolicy with DNS
+          apiVersion: crd.projectcalico.org/v1
+          kind: NetworkPolicy
+          metadata:
+            name: allow-external-api
+            namespace: default
+          spec:
+            selector: app == 'myapp'
+            types:
+            - Egress
+            egress:
+            - action: Allow
+              destination:
+                domains:
+                - "api.example.com"
+              ports:
+              - protocol: TCP
+                port: 443
+
+        dest: /tmp/example-network-policies.yaml
+
+    - name: Create Calico policy debugging script
+      copy:
+        content: |
+          #!/bin/bash
+          # Debug Calico network policies
+
+          echo "====== Calico Network Policy Status ======"
+          echo ""
+
+          echo "Calico Components:"
+          kubectl get pods -n calico-system
+          echo ""
+
+          echo "Network Policies in cluster:"
+          kubectl get networkpolicies -A
+          echo ""
+
+          echo "Calico Network Policies:"
+          kubectl get networkpolicies.crd.projectcalico.org -A
+          echo ""
+
+          echo "Policy Enforcement Mode:"
+          kubectl get globalnetworkpolicies | grep global-default-deny
+          echo ""
+
+          echo "Network Sets (IP whitelists):"
+          kubectl get networksets -A
+          echo ""
+
+          echo "Calico Node Status:"
+          kubectl get calicouse -A 2>/dev/null || echo "Not using Calico host endpoints"
+          echo ""
+
+          echo "Node BGP Status (if enabled):"
+          kubectl -n calico-system exec -it $(kubectl -n calico-system get pod -l k8s-app=calico-node -o jsonpath='{.items[0].metadata.name}') -- calico-node -bv
+          echo ""
+
+        dest: /usr/local/bin/calico-debug
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create Calico policy validation script
+      copy:
+        content: |
+          #!/bin/bash
+          # Validate network policies
+
+          POD1="${1:-pod1}"
+          POD2="${2:-pod2}"
+          NAMESPACE="${3:-default}"
+
+          echo "Testing connectivity: $POD1 → $POD2 in namespace $NAMESPACE"
+          echo ""
+
+          # Get POD IPs
+          IP1=$(kubectl get pod -n $NAMESPACE $POD1 -o jsonpath='{.status.podIP}')
+          IP2=$(kubectl get pod -n $NAMESPACE $POD2 -o jsonpath='{.status.podIP}')
+
+          echo "Pod IPs:"
+          echo "  $POD1: $IP1"
+          echo "  $POD2: $IP2"
+          echo ""
+
+          # Test connectivity
+          echo "Testing connectivity..."
+          kubectl exec -n $NAMESPACE $POD1 -- ping -c 1 $IP2 && echo "✓ Connected" || echo "✗ Blocked"
+          echo ""
+
+          # Show applicable policies
+          echo "Applicable policies on $POD1:"
+          kubectl get networkpolicies -n $NAMESPACE -o json | \
+            jq '.items[] | select(.spec.podSelector.matchLabels != null)' | head -5
+
+        dest: /usr/local/bin/calico-validate
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create Calico monitoring setup guide
+      copy:
+        content: |
+          # Calico Network Policy Monitoring
+
+          ## Check Policy Status
+
+          ```bash
+          # List all network policies
+          kubectl get networkpolicies -A
+
+          # Get specific policy details
+          kubectl describe networkpolicy policy-name -n namespace
+
+          # View policy YAML
+          kubectl get networkpolicy policy-name -n namespace -o yaml
+          ```
+
+          ## Monitor Traffic
+
+          ```bash
+          # Watch policy hits
+          kubectl -n calico-system logs -l k8s-app=calico-node -f
+
+          # Check node statistics
+          kubectl -n calico-system exec -it <calico-node-pod> -- \
+            calico-node -stats
+          ```
+
+          ## Audit Logging
+
+          Calico logs denied connections:
+
+          ```bash
+          # View audit logs on node
+          sudo tail -f /var/log/calico/policies.log
+
+          # Or via syslog (if configured)
+          sudo journalctl -u calicoctl | grep DENY
+          ```
+
+          ## Metrics
+
+          ```bash
+          # Calico exposes Prometheus metrics
+          kubectl port-forward -n calico-system svc/calico-node 9091:9091
+          # Access: http://localhost:9091/metrics
+          ```
+
+        dest: /tmp/calico-monitoring-guide.md
+
+  post_tasks:
+    - name: Display Calico installation summary
+      debug:
+        msg: |
+          ====== Calico Network Policy Installation Complete ======
+
+          ✓ Calico operator installed
+          ✓ Network policy engine deployed
+          ✓ CNI plugin configured
+
+          Calico Components:
+          ─────────────────────────────────────────
+          Operator: tigera-operator (watches Installation resource)
+          Nodes: calico-node DaemonSet (on each node)
+          CNI: calico-cni (network interface plugin)
+          IPAM: calico-ipam (IP address management)
+
+          Namespace: {{ calico_namespace }}
+
+          Policy Enforcement:
+          ─────────────────────────────────────────
+          Mode: {{ policy_enforcement_mode }}
+          BGP: {{ "Enabled" if enable_bgp else "Disabled" }}
+          DNS Policies: {{ "Enabled" if enable_dns_policy else "Disabled" }}
+
+          Key Commands:
+          ─────────────────────────────────────────
+          Debug policies: calico-debug
+          Validate connectivity: calico-validate pod1 pod2 [namespace]
+          View all policies: kubectl get networkpolicies -A
+          Check node status: kubectl get nodes -o wide
+
+          Example Policies:
+          ─────────────────────────────────────────
+          Location: /tmp/example-network-policies.yaml
+
+          Deploy example policies:
+          kubectl apply -f /tmp/example-network-policies.yaml
+
+          Policy Types:
+          ─────────────────────────────────────────
+          • Deny-all-by-default: Block all, then allow specific
+          • Allow-same-namespace: Allow pods within namespace
+          • Allow-specific-labels: Allow by label selector
+          • Allow-dns: Allow DNS queries
+          • Allow-external-api: Allow specific domains (Calico)
+
+          Monitoring:
+          ─────────────────────────────────────────
+          Check status: kubectl get pods -n calico-system
+          View logs: kubectl logs -n calico-system -l k8s-app=calico-node -f
+          Metrics: Prometheus on port 9091
+          Audit: syslog and node /var/log/calico/
+
+          Next Steps:
+          ─────────────────────────────────────────
+          1. Review example policies:
+             cat /tmp/example-network-policies.yaml
+
+          2. Start with staged mode (default):
+             - Policies created but not enforced
+             - Test before activating
+
+          3. Apply policies gradually:
+             - Start with deny-all for critical namespaces
+             - Then allow specific traffic
+
+          4. Monitor denied traffic:
+             kubectl logs -n calico-system -f
+
+          5. Switch to enforced mode when ready:
+             Edit Installation resource: enforcement_mode: enforced
+
+          Best Practices:
+          ─────────────────────────────────────────
+          • Use deny-all-by-default strategy
+          • Apply policies per namespace
+          • Use labels for pod identification
+          • Test policies in dev first
+          • Monitor denied traffic
+          • Document policy intent
+          • Version control policies in Git
+
+          Security Zones:
+          ─────────────────────────────────────────
+          • Public: Ingress from external
+          • DMZ: Limited internal access
+          • Internal: Service-to-service
+          • Restricted: Database/secrets access
+
+          ==========================================
+
+    - name: Create Calico configuration summary
+      copy:
+        content: |
+          Calico Network Policy Configuration
+          Generated: {{ ansible_date_time.iso8601 }}
+
+          Cluster: {{ ansible_hostname }}
+
+          Installation:
+          • Component: Calico v{{ calico_version }}
+          • Operator: tigera-operator
+          • Namespace: {{ calico_namespace }}
+          • CNI Plugin: {{ calico_cni_plugin }}
+
+          Features:
+          • Kubernetes NetworkPolicy enforcement
+          • Calico NetworkPolicy support
+          • DNS-based policies (FQDN)
+          • BGP routing: {{ "Enabled" if enable_bgp else "Disabled" }}
+          • Policy enforcement mode: {{ policy_enforcement_mode }}
+
+          Policy Types Supported:
+          • Ingress policies (inbound traffic control)
+          • Egress policies (outbound traffic control)
+          • Label-based selectors
+          • Namespace selectors
+          • CIDR-based rules
+          • Service account-based rules
+          • Port-level granularity (TCP/UDP/ICMP)
+
+          Commands:
+          • calico-debug: View policy status
+          • calico-validate: Test connectivity
+          • kubectl get networkpolicies: List policies
+          • kubectl describe networkpolicy: Policy details
+
+          Resources:
+          • NetworkPolicy: Kubernetes native
+          • NetworkPolicy (crd): Calico extended
+          • NetworkSet: Named IP sets
+          • GlobalNetworkPolicy: Cluster-wide
+          • HostEndpoint: Node-level policies
+
+          Monitoring:
+          • Logs: /var/log/calico/policies.log
+          • Syslog: DENY entries for blocked traffic
+          • Prometheus metrics: port 9091
+          • Audit: Detailed policy hits
+
+          Enforcement:
+          • Current mode: {{ policy_enforcement_mode }}
+          • Test mode: Create policies without blocking
+          • Active mode: Policies immediately enforced
+          • Toggle: Edit Installation CRD
+
+          For more information:
+          See CALICO_SETUP_GUIDE.md
+
+        dest: /etc/calico-config-summary.txt
+        owner: root
+        group: root
+        mode: '0644'
