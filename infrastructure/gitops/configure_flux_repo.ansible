@@ -1,0 +1,637 @@
+---
+# Configure Git repository for Flux GitOps synchronization
+#
+# This playbook:
+# - Sets up Git repository structure
+# - Configures Flux to sync from repository
+# - Creates initial Kustomizations
+# - Sets up branch protection
+# - Generates deployment documentation
+#
+# Usage:
+#   ansible-playbook infrastructure/gitops/configure_flux_repo.ansible \
+#     -e git_repo="https://github.com/your-org/cluster-config" \
+#     -e git_branch="main" \
+#     -e github_token="ghp_xxxxx"
+#
+
+- hosts: all
+  gather_facts: yes
+  become: no  # Git operations don't need sudo
+
+  vars:
+    git_repo: "https://github.com/picocluster/cluster-config.git"
+    git_branch: "main"
+    git_path: "./clusters"
+    local_repo_path: "/tmp/flux-repo"
+    github_token: ""
+    git_user: "flux-bot"
+    git_email: "flux@cluster.local"
+
+  pre_tasks:
+    - name: Display Flux repository configuration information
+      debug:
+        msg: |
+          ====== Flux Git Repository Configuration ======
+
+          Git Repository: {{ git_repo }}
+          Branch: {{ git_branch }}
+          Local Path: {{ local_repo_path }}
+          Git Config Path: {{ git_path }}
+
+          Configuration Steps:
+          1. Clone repository locally
+          2. Create directory structure
+          3. Generate Kustomization files
+          4. Create example manifests
+          5. Push configuration to Git
+          6. Flux automatically syncs
+
+          Repository Structure:
+          clusters/
+          ├── production/
+          │   ├── kustomization.yaml
+          │   └── apps/
+          ├── development/
+          │   ├── kustomization.yaml
+          │   └── apps/
+          └── flux-system/
+              ├── gotk-components.yaml
+              ├── gotk-sync.yaml
+              └── kustomization.yaml
+
+          ======================================
+
+  tasks:
+    - name: Check if Git is available
+      command: git --version
+      changed_when: false
+
+    - name: Create local repository directory
+      file:
+        path: "{{ local_repo_path }}"
+        state: directory
+        mode: '0755'
+
+    - name: Clone or update repository
+      block:
+        - name: Check if repository exists locally
+          stat:
+            path: "{{ local_repo_path }}/.git"
+          register: repo_exists
+
+        - name: Clone repository
+          shell: |
+            cd {{ local_repo_path }}
+            git clone {{ git_repo }} .
+          when: not repo_exists.stat.exists
+
+        - name: Update existing repository
+          shell: |
+            cd {{ local_repo_path }}
+            git fetch origin
+            git checkout {{ git_branch }}
+          when: repo_exists.stat.exists
+
+    - name: Configure Git user
+      shell: |
+        git config user.name "{{ git_user }}"
+        git config user.email "{{ git_email }}"
+      args:
+        chdir: "{{ local_repo_path }}"
+
+    - name: Create directory structure
+      file:
+        path: "{{ local_repo_path }}/{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "clusters/production/apps"
+        - "clusters/development/apps"
+        - "clusters/flux-system"
+        - "infrastructure/base"
+        - "infrastructure/overlays/production"
+        - "infrastructure/overlays/development"
+        - ".github/workflows"
+
+    - name: Create production Kustomization
+      copy:
+        content: |
+          # Production cluster configuration
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          metadata:
+            name: production
+            namespace: flux-system
+
+          bases:
+            - ../../infrastructure/base
+
+          patchesStrategicMerge:
+            - patches/image-tags.yaml
+
+          resources:
+            - apps/
+
+          replicas:
+            - name: deployment
+              count: 3
+
+          images:
+            - name: example-app
+              newTag: "1.0.0"  # Update via image automation
+
+        dest: "{{ local_repo_path }}/clusters/production/kustomization.yaml"
+
+    - name: Create development Kustomization
+      copy:
+        content: |
+          # Development cluster configuration
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+          metadata:
+            name: development
+            namespace: flux-system
+
+          bases:
+            - ../../infrastructure/base
+
+          patchesStrategicMerge:
+            - patches/image-tags.yaml
+
+          resources:
+            - apps/
+
+          replicas:
+            - name: deployment
+              count: 1
+
+          images:
+            - name: example-app
+              newTag: "dev"  # Latest development build
+
+        dest: "{{ local_repo_path }}/clusters/development/kustomization.yaml"
+
+    - name: Create infrastructure base
+      copy:
+        content: |
+          # Base infrastructure configuration
+          apiVersion: kustomize.config.k8s.io/v1beta1
+          kind: Kustomization
+
+          commonLabels:
+            app.kubernetes.io/managed-by: flux
+
+          resources:
+            - namespaces.yaml
+            - rbac.yaml
+            - network-policies.yaml
+
+          patches:
+            - target:
+                kind: Deployment
+              patch: |-
+                - op: add
+                  path: /spec/template/spec/securityContext
+                  value:
+                    runAsNonRoot: true
+                    runAsUser: 1000
+
+        dest: "{{ local_repo_path }}/infrastructure/base/kustomization.yaml"
+
+    - name: Create example namespace manifest
+      copy:
+        content: |
+          ---
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: applications
+            labels:
+              name: applications
+          ---
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: monitoring
+            labels:
+              name: monitoring
+
+        dest: "{{ local_repo_path }}/infrastructure/base/namespaces.yaml"
+
+    - name: Create example application manifest
+      copy:
+        content: |
+          ---
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: example-app
+            namespace: applications
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: example-app
+            template:
+              metadata:
+                labels:
+                  app: example-app
+              spec:
+                containers:
+                  - name: app
+                    image: nginx:latest
+                    ports:
+                      - containerPort: 80
+                    resources:
+                      requests:
+                        memory: "64Mi"
+                        cpu: "100m"
+                      limits:
+                        memory: "128Mi"
+                        cpu: "200m"
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: example-app
+            namespace: applications
+          spec:
+            selector:
+              app: example-app
+            ports:
+              - protocol: TCP
+                port: 80
+                targetPort: 80
+            type: ClusterIP
+
+        dest: "{{ local_repo_path }}/clusters/production/apps/example-app.yaml"
+
+    - name: Create README
+      copy:
+        content: |
+          # PicoCluster Configuration
+
+          This repository contains all configuration for managing the PicoCluster infrastructure using Flux GitOps.
+
+          ## Directory Structure
+
+          ```
+          clusters/
+          ├── production/     # Production cluster configuration
+          │   ├── kustomization.yaml
+          │   └── apps/
+          ├── development/    # Development cluster configuration
+          │   ├── kustomization.yaml
+          │   └── apps/
+          └── flux-system/    # Flux system configuration
+              └── gotk-*.yaml
+
+          infrastructure/
+          ├── base/           # Base infrastructure
+          │   └── kustomization.yaml
+          └── overlays/       # Environment-specific overrides
+              ├── production/
+              └── development/
+          ```
+
+          ## Quick Start
+
+          1. **View cluster status**:
+             ```bash
+             kubectl get all -A
+             flux get all --all-namespaces
+             ```
+
+          2. **Deploy application**:
+             ```bash
+             # Create manifest in clusters/<env>/apps/
+             git add .
+             git commit -m "Add new app"
+             git push
+             # Flux syncs within 1 minute
+             ```
+
+          3. **Update application**:
+             ```bash
+             # Edit manifests
+             git add .
+             git commit -m "Update app config"
+             git push
+             # Flux automatically applies changes
+             ```
+
+          4. **Rollback**:
+             ```bash
+             git revert <commit-hash>
+             git push
+             ```
+
+          ## GitOps Workflow
+
+          ```
+          Developer
+              ↓
+          Create/edit manifests in Git
+              ↓
+          Create Pull Request
+              ↓
+          Review & Approve
+              ↓
+          Merge to main branch
+              ↓
+          Flux detects changes
+              ↓
+          Applies manifests to cluster
+              ↓
+          Cluster updated automatically
+          ```
+
+          ## Best Practices
+
+          - Commit all infrastructure to Git
+          - Use pull requests for changes
+          - Keep main branch stable (protected)
+          - Tag releases for easy rollbacks
+          - Test changes in development first
+          - Use Kustomization for environment variations
+          - Implement secrets management (sealed-secrets/external-secrets)
+
+          ## Useful Commands
+
+          ```bash
+          # Flux status
+          flux-status
+
+          # Manual reconciliation
+          flux-sync
+
+          # View logs
+          flux-logs source-controller
+          flux-logs kustomize-controller
+
+          # Git history
+          git log --oneline
+          git show <commit>
+
+          # Rollback
+          git revert <commit>
+          git push
+          ```
+
+          ## Support
+
+          For documentation, see GITOPS_SETUP_GUIDE.md
+
+        dest: "{{ local_repo_path }}/README.md"
+
+    - name: Create GitHub Actions workflow for CI
+      copy:
+        content: |
+          name: Validate Manifests
+
+          on:
+            pull_request:
+              paths:
+                - 'clusters/**'
+                - 'infrastructure/**'
+
+          jobs:
+            validate:
+              runs-on: ubuntu-latest
+              steps:
+                - uses: actions/checkout@v3
+
+                - name: Validate Kustomizations
+                  run: |
+                    curl -s https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh | bash
+                    ./kustomize.sh
+                    kustomize build clusters/production
+                    kustomize build clusters/development
+
+                - name: Validate with kubeval
+                  run: |
+                    curl -L https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz | tar xz
+                    kustomize build clusters/production | ./kubeval
+
+        dest: "{{ local_repo_path }}/.github/workflows/validate.yaml"
+
+    - name: Create .gitignore
+      copy:
+        content: |
+          # Ignore compiled kustomizations
+          /kustomize
+          *.o
+          *.so
+          *.lo
+          *.la
+          *.o
+          *.out
+          *.exe
+          *.dll
+          *.so
+          *.dylib
+          .DS_Store
+          dist/
+          build/
+
+          # Ignore IDE
+          .vscode/
+          .idea/
+          *.swp
+          *.swo
+          *~
+          .vim
+
+          # Ignore secrets
+          .env
+          .env.local
+          secrets.yaml
+          sealed-secrets.yaml
+
+        dest: "{{ local_repo_path }}/.gitignore"
+
+    - name: Commit and push repository
+      block:
+        - name: Check git status
+          shell: git status --short
+          args:
+            chdir: "{{ local_repo_path }}"
+          register: git_status
+          changed_when: false
+
+        - name: Add all changes
+          shell: git add .
+          args:
+            chdir: "{{ local_repo_path }}"
+          when: git_status.stdout | length > 0
+
+        - name: Commit changes
+          shell: git commit -m "Initial Flux configuration with directory structure and examples"
+          args:
+            chdir: "{{ local_repo_path }}"
+          when: git_status.stdout | length > 0
+          ignore_errors: yes
+
+        - name: Push to remote
+          shell: git push origin {{ git_branch }}
+          args:
+            chdir: "{{ local_repo_path }}"
+          when: git_status.stdout | length > 0
+          ignore_errors: yes
+          register: git_push
+
+  post_tasks:
+    - name: Display repository configuration summary
+      debug:
+        msg: |
+          ====== Flux Git Repository Configuration Complete ======
+
+          Repository Setup:
+          ─────────────────────────────────────────
+          Local Path: {{ local_repo_path }}
+          Remote: {{ git_repo }}
+          Branch: {{ git_branch }}
+          Git User: {{ git_user }}
+
+          Directory Structure Created:
+          ─────────────────────────────────────────
+          clusters/production/      - Production cluster config
+          clusters/development/     - Development cluster config
+          infrastructure/base/      - Shared infrastructure
+          infrastructure/overlays/  - Environment overrides
+
+          Next Steps:
+          ─────────────────────────────────────────
+          1. Verify repository structure:
+             cd {{ local_repo_path }}
+             git log --oneline
+             tree -L 2
+
+          2. Make changes and push:
+             cd {{ local_repo_path }}
+             # Edit manifests
+             git add .
+             git commit -m "Your changes"
+             git push origin {{ git_branch }}
+
+          3. Monitor Flux sync:
+             flux-status
+             flux get all --all-namespaces
+
+          4. Deploy applications:
+             # Create manifest in clusters/production/apps/
+             # or clusters/development/apps/
+             git push
+             # Flux syncs within 1 minute
+
+          5. Update branch protection rules in GitHub:
+             - Require pull request reviews
+             - Require status checks to pass
+             - Dismiss stale pull request approvals
+             - Require branches to be up to date
+
+          Workflow:
+          ─────────────────────────────────────────
+          Feature Branch → Pull Request → Review → Merge → Flux Sync → Deployed
+
+          Example Deployment:
+          ─────────────────────────────────────────
+          cd {{ local_repo_path }}
+          cp clusters/production/apps/example-app.yaml clusters/production/apps/my-app.yaml
+          # Edit my-app.yaml
+          git add .
+          git commit -m "Add my-app"
+          git push origin {{ git_branch }}
+
+          Flux automatically applies within 1 minute!
+
+          ==========================================
+
+    - name: Create deployment guide
+      copy:
+        content: |
+          # Flux GitOps Deployment Guide
+
+          Repository: {{ git_repo }}
+          Branch: {{ git_branch }}
+          Local Path: {{ local_repo_path }}
+
+          ## Daily Workflow
+
+          ### Deploying New Application
+
+          1. Create application manifest:
+             ```bash
+             cd {{ local_repo_path }}
+             cat > clusters/production/apps/my-app.yaml << EOF
+             apiVersion: apps/v1
+             kind: Deployment
+             metadata:
+               name: my-app
+               namespace: applications
+             spec:
+               replicas: 2
+               selector:
+                 matchLabels:
+                   app: my-app
+               template:
+                 metadata:
+                   labels:
+                     app: my-app
+                 spec:
+                   containers:
+                     - name: app
+                       image: my-image:latest
+             EOF
+             ```
+
+          2. Commit and push:
+             ```bash
+             git add .
+             git commit -m "Deploy my-app"
+             git push origin {{ git_branch }}
+             ```
+
+          3. Verify deployment:
+             ```bash
+             flux-status
+             kubectl get deployments -n applications
+             ```
+
+          ### Updating Application
+
+          1. Edit manifest:
+             ```bash
+             cd {{ local_repo_path }}
+             nano clusters/production/apps/my-app.yaml
+             ```
+
+          2. Commit and push:
+             ```bash
+             git add .
+             git commit -m "Update my-app to v2.0"
+             git push origin {{ git_branch }}
+             ```
+
+          ### Rolling Back
+
+          1. Find commit to revert:
+             ```bash
+             git log --oneline | head -10
+             ```
+
+          2. Revert commit:
+             ```bash
+             git revert <commit-hash>
+             git push origin {{ git_branch }}
+             ```
+
+          ## Repository Structure
+
+          - `clusters/production/` - Production apps
+          - `clusters/development/` - Development apps
+          - `infrastructure/base/` - Shared config
+          - `.github/workflows/` - CI/CD pipelines
+
+        dest: "{{ local_repo_path }}/DEPLOYMENT_GUIDE.md"

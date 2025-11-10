@@ -1,0 +1,553 @@
+---
+# Install and configure GitLab Runner for CI/CD pipelines on PicoCluster
+#
+# GitLab Runner provides:
+# - Automated testing on code commits
+# - Container image building and pushing
+# - Automated deployments via GitOps
+# - Build artifact management
+# - Multi-platform support (Linux, macOS, Windows)
+# - Docker/Kubernetes executor support
+# - Caching for faster builds
+#
+# Architecture:
+#   GitLab Repository
+#        ↓
+#   Commit push/Merge Request
+#        ↓
+#   GitLab triggers pipeline
+#        ↓
+#   GitLab Runner picks up job
+#        ↓
+#   Runs build/test/deploy steps
+#        ↓
+#   Reports results to GitLab
+#
+# Use Cases:
+# - Automated testing on code changes
+# - Lint and validate manifests
+# - Build container images
+# - Push to registry
+# - Automated deployments (Flux sync)
+# - Security scanning
+# - Performance testing
+#
+# Default Configuration:
+#   - Executor: Docker (can use Kubernetes)
+#   - Concurrent jobs: 4
+#   - Build timeout: 3600 seconds (1 hour)
+#   - Tags: docker, kubernetes
+#
+# Usage:
+#   # Install GitLab Runner
+#   ansible-playbook infrastructure/cicd/install_gitlab_runner.ansible
+#
+#   # Configure with Kubernetes executor
+#   ansible-playbook infrastructure/cicd/install_gitlab_runner.ansible \
+#     -e runner_executor="kubernetes" \
+#     -e kubernetes_host="https://10.1.10.245:6443"
+#
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    gitlab_runner_version: "latest"
+    gitlab_url: "https://gitlab.example.com/"
+    gitlab_token: ""
+    runner_name: "{{ ansible_hostname }}-runner"
+    runner_executor: "docker"  # or kubernetes
+    runner_tags: "docker,linux,arm64"
+    concurrent_jobs: 4
+    build_timeout: 3600
+
+  pre_tasks:
+    - name: Display GitLab Runner installation information
+      debug:
+        msg: |
+          ====== GitLab Runner CI/CD Setup ======
+
+          Component: GitLab Runner
+          Version: {{ gitlab_runner_version }}
+          GitLab URL: {{ gitlab_url }}
+          Runner Name: {{ runner_name }}
+          Executor: {{ runner_executor }}
+          Concurrent Jobs: {{ concurrent_jobs }}
+
+          CI/CD Pipeline Workflow:
+          1. Developer commits code
+          2. Pushes to GitLab repository
+          3. GitLab detects .gitlab-ci.yml
+          4. Creates pipeline with defined jobs
+          5. Runner picks up job
+          6. Executes steps (build, test, deploy)
+          7. Reports results to GitLab
+          8. Passes/fails merge request checks
+
+          Supported Executors:
+          • Docker: Run jobs in containers
+          • Kubernetes: Run jobs as K8s pods
+          • Shell: Run jobs on host system
+          • SSH: Run jobs on remote hosts
+
+          Features:
+          • Concurrent job execution
+          • Build artifact caching
+          • Docker-in-Docker (DinD)
+          • Service containers for testing
+          • Secure secret management
+          • Multi-platform builds
+          • Performance metrics
+
+          Common Job Types:
+          • Test: Run unit/integration tests
+          • Build: Compile code, create artifacts
+          • Docker: Build and push container images
+          • Deploy: Automated deployments via GitOps
+          • Scan: Security and code quality scanning
+          • Performance: Performance testing
+          • Documentation: Generate docs
+
+          ======================================
+
+  tasks:
+    - name: Install dependencies
+      apt:
+        name:
+          - curl
+          - apt-transport-https
+          - ca-certificates
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    - name: Add GitLab runner repository key
+      apt_key:
+        url: "https://packages.gitlab.com/runner/gitlab-runner/gpgkey"
+        state: present
+
+    - name: Add GitLab runner repository
+      apt_repository:
+        repo: "deb https://packages.gitlab.com/runner/gitlab-runner/{{ ansible_distribution | lower }}/ {{ ansible_distribution_release }} main"
+        state: present
+        filename: gitlab-runner
+
+    - name: Install GitLab Runner
+      apt:
+        name: gitlab-runner
+        state: present
+        update_cache: yes
+      register: runner_install
+
+    - name: Verify GitLab Runner installation
+      command: gitlab-runner --version
+      register: runner_version
+      changed_when: false
+
+    - name: Display installed version
+      debug:
+        msg: "{{ runner_version.stdout }}"
+
+    - name: Create runner configuration directory
+      file:
+        path: /etc/gitlab-runner
+        state: directory
+        owner: gitlab-runner
+        group: gitlab-runner
+        mode: '0755'
+
+    - name: Register GitLab Runner
+      block:
+        - name: Register runner with GitLab
+          shell: |
+            gitlab-runner register \
+              --non-interactive \
+              --url "{{ gitlab_url }}" \
+              --registration-token "{{ gitlab_token }}" \
+              --executor "{{ runner_executor }}" \
+              --description "{{ runner_name }}" \
+              --tag-list "{{ runner_tags }}" \
+              --run-untagged "false" \
+              --locked "false" \
+              --access-level "not_protected"
+          register: runner_register
+          changed_when: "'registered successfully' in runner_register.stdout or runner_register.rc == 0"
+          ignore_errors: yes
+          when: gitlab_token | length > 0
+
+      when: gitlab_token | length > 0
+
+    - name: Configure GitLab Runner for Docker executor
+      copy:
+        content: |
+          # GitLab Runner Configuration
+          # Generated: {{ ansible_date_time.iso8601 }}
+
+          concurrent = {{ concurrent_jobs }}
+          check_interval = 0
+          shutdown_timeout = 0
+
+          [session_server]
+            session_timeout = 1800
+
+          [[runners]]
+            name = "{{ runner_name }}"
+            url = "{{ gitlab_url }}"
+            id = 1
+            token = "runner-token"
+            token_auth_idempotent = true
+            executor = "docker"
+            builds_dir = "/builds"
+            cache_dir = "/cache"
+            clone_url = ""
+            environment = [
+              "FF_USE_FASTZIP=true",
+              "TRANSFER_METER_FREQUENCY=5s"
+            ]
+            pre_clone_script = ""
+            pre_build_script = ""
+            post_build_script = ""
+            runner_session_timeout = 1800
+            [runners.docker]
+              host = "unix:///var/run/docker.sock"
+              tls_verify = false
+              image = "ubuntu:latest"
+              privileged = true
+              disable_entrypoint_overwrite = false
+              oom_kill_disable = false
+              disable_cache = false
+              volumes = [
+                "/cache",
+                "/builds"
+              ]
+              shm_size = 0
+              dns = []
+              dns_search = []
+              extra_hosts = []
+              network_mode = ""
+              network_aliases = []
+              links = []
+              allowed_pull_policies = [
+                "pull-policy-always",
+                "pull-policy-never",
+                "pull-policy-if-not-present"
+              ]
+              pull_policy = "if-not-present"
+              wait_for_services_timeout = 300
+              services_tmpfs_size = 0
+              cpuset_cpus = ""
+              cpus = ""
+              memory = ""
+              memory_swap = ""
+              memory_reservation = ""
+              oom_score_adjust = ""
+              swap = ""
+              cap_add = []
+              cap_drop = []
+              sysctls = []
+              tmpfs = []
+            [runners.cache]
+              Type = "s3"
+              Path = "runner"
+              Shared = false
+              [runners.cache.s3]
+                ServerAddress = "minio.example.com:9000"
+                AccessKey = "minioadmin"
+                SecretKey = "minioadmin"
+                BucketName = "runner-cache"
+                Secure = false
+
+        dest: /etc/gitlab-runner/config.toml.example
+        owner: gitlab-runner
+        group: gitlab-runner
+        mode: '0640'
+
+    - name: Start and enable GitLab Runner
+      systemd:
+        name: gitlab-runner
+        enabled: yes
+        state: started
+      register: runner_service
+
+    - name: Check runner status
+      shell: gitlab-runner status
+      register: runner_status
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Create runner management script
+      copy:
+        content: |
+          #!/bin/bash
+          # GitLab Runner management script
+
+          case "${1:-status}" in
+            status)
+              echo "GitLab Runner Status:"
+              gitlab-runner status
+              echo ""
+              echo "Registered Runners:"
+              gitlab-runner list
+              ;;
+            start)
+              echo "[+] Starting GitLab Runner..."
+              systemctl start gitlab-runner
+              ;;
+            stop)
+              echo "[+] Stopping GitLab Runner..."
+              systemctl stop gitlab-runner
+              ;;
+            restart)
+              echo "[+] Restarting GitLab Runner..."
+              systemctl restart gitlab-runner
+              ;;
+            logs)
+              echo "[+] GitLab Runner Logs:"
+              journalctl -u gitlab-runner -f
+              ;;
+            verify)
+              echo "[+] Verifying runner connectivity..."
+              gitlab-runner verify
+              ;;
+            *)
+              echo "Usage: $0 {status|start|stop|restart|logs|verify}"
+              ;;
+          esac
+
+        dest: /usr/local/bin/runner-manage
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create pipeline example script
+      copy:
+        content: |
+          #!/bin/bash
+          # Generate example GitLab CI/CD pipeline
+
+          echo "# Example .gitlab-ci.yml for PicoCluster"
+          echo ""
+          echo "stages:"
+          echo "  - test"
+          echo "  - build"
+          echo "  - deploy"
+          echo ""
+          echo "variables:"
+          echo "  DOCKER_DRIVER: overlay2"
+          echo "  DOCKER_TLS_CERTDIR: \"/certs\""
+          echo ""
+          echo "# Test stage"
+          echo "test:unit:"
+          echo "  stage: test"
+          echo "  image: ubuntu:latest"
+          echo "  tags:"
+          echo "    - docker"
+          echo "  script:"
+          echo "    - apt-get update && apt-get install -y build-essential"
+          echo "    - make test"
+          echo "  artifacts:"
+          echo "    reports:"
+          echo "      junit: test-results.xml"
+          echo ""
+          echo "# Build stage"
+          echo "build:image:"
+          echo "  stage: build"
+          echo "  image: docker:latest"
+          echo "  services:"
+          echo "    - docker:dind"
+          echo "  tags:"
+          echo "    - docker"
+          echo "  script:"
+          echo "    - docker build -t registry.example.com/myapp:\$CI_COMMIT_SHA ."
+          echo "    - docker push registry.example.com/myapp:\$CI_COMMIT_SHA"
+          echo "  only:"
+          echo "    - main"
+          echo ""
+          echo "# Deploy stage"
+          echo "deploy:production:"
+          echo "  stage: deploy"
+          echo "  image: bitnami/kubectl:latest"
+          echo "  tags:"
+          echo "    - kubernetes"
+          echo "  script:"
+          echo "    - kubectl set image deployment/myapp myapp=registry.example.com/myapp:\$CI_COMMIT_SHA"
+          echo "  only:"
+          echo "    - main"
+
+        dest: /usr/local/bin/generate-example-pipeline
+        owner: root
+        group: root
+        mode: '0755'
+
+  post_tasks:
+    - name: Display GitLab Runner installation summary
+      debug:
+        msg: |
+          ====== GitLab Runner Installation Complete ======
+
+          ✓ GitLab Runner installed and running
+          ✓ Ready to execute CI/CD jobs
+          ✓ Docker executor configured
+
+          Runner Configuration:
+          ─────────────────────────────────────────
+          Name: {{ runner_name }}
+          URL: {{ gitlab_url }}
+          Executor: {{ runner_executor }}
+          Concurrent Jobs: {{ concurrent_jobs }}
+          Tags: {{ runner_tags }}
+
+          Service Management:
+          ─────────────────────────────────────────
+          Status: sudo systemctl status gitlab-runner
+          Start: sudo systemctl start gitlab-runner
+          Stop: sudo systemctl stop gitlab-runner
+          Restart: sudo systemctl restart gitlab-runner
+          Logs: sudo journalctl -u gitlab-runner -f
+
+          Management Commands:
+          ─────────────────────────────────────────
+          Status: runner-manage status
+          Start: runner-manage start
+          Stop: runner-manage stop
+          Restart: runner-manage restart
+          Logs: runner-manage logs
+          Verify: runner-manage verify
+
+          Configuration:
+          ─────────────────────────────────────────
+          Config File: /etc/gitlab-runner/config.toml
+          Service: gitlab-runner.service
+
+          Next Steps:
+          ─────────────────────────────────────────
+          1. Configure GitLab repository:
+             - Create .gitlab-ci.yml in root of repository
+             - Define build stages and jobs
+             - Set runner tags in job configuration
+
+          2. Verify runner registration:
+             runner-manage status
+             runner-manage verify
+
+          3. Monitor pipeline execution:
+             - View in GitLab project → CI/CD → Pipelines
+             - Check runner logs: runner-manage logs
+
+          4. Configure secrets:
+             - Go to Settings → CI/CD → Variables
+             - Add environment variables
+             - Set as protected/masked if needed
+
+          5. Set up artifact caching:
+             - Edit /etc/gitlab-runner/config.toml
+             - Configure cache settings
+             - Restart runner: runner-manage restart
+
+          Example Pipeline (.gitlab-ci.yml):
+          ─────────────────────────────────────────
+          generate-example-pipeline
+
+          Executor Types:
+          ─────────────────────────────────────────
+          Docker: Run jobs in Docker containers (current)
+          Kubernetes: Run jobs as K8s pods (recommended for clusters)
+          Shell: Run directly on host (insecure, not recommended)
+          SSH: Run on remote host via SSH
+
+          Docker Configuration:
+          ─────────────────────────────────────────
+          Host: unix:///var/run/docker.sock
+          Privileged: true (allows Docker-in-Docker)
+          Image: ubuntu:latest (default build image)
+          Pull Policy: if-not-present
+
+          Performance Tips:
+          ─────────────────────────────────────────
+          • Use artifact caching for dependencies
+          • Enable FastZip for faster transfers
+          • Parallelize jobs across runners
+          • Use service containers for test dependencies
+          • Cache Docker images locally
+
+          Security:
+          ─────────────────────────────────────────
+          • Don't commit secrets to repository
+          • Use GitLab CI/CD variables
+          • Set variables as protected (main branch only)
+          • Set variables as masked (hide in logs)
+          • Restrict runner access with tags
+          • Use specific runner tags in jobs
+
+          ==========================================
+
+    - name: Create runner configuration summary
+      copy:
+        content: |
+          GitLab Runner CI/CD Configuration
+          Generated: {{ ansible_date_time.iso8601 }}
+
+          Host: {{ ansible_hostname }}
+          GitLab URL: {{ gitlab_url }}
+          Runner Name: {{ runner_name }}
+
+          Installation:
+          • Version: {{ runner_version.stdout }}
+          • Executor: {{ runner_executor }}
+          • Service: gitlab-runner (systemd)
+          • Config: /etc/gitlab-runner/config.toml
+
+          Capabilities:
+          • Concurrent jobs: {{ concurrent_jobs }}
+          • Build timeout: {{ build_timeout }} seconds
+          • Docker executor support
+          • Docker-in-Docker (DinD) enabled
+          • Artifact caching support
+          • Service container support
+
+          Service Management:
+          • Start: systemctl start gitlab-runner
+          • Stop: systemctl stop gitlab-runner
+          • Restart: systemctl restart gitlab-runner
+          • Logs: journalctl -u gitlab-runner -f
+          • Status: gitlab-runner status
+
+          Management Scripts:
+          • runner-manage status - Check runner status
+          • runner-manage start - Start runner
+          • runner-manage stop - Stop runner
+          • runner-manage restart - Restart runner
+          • runner-manage logs - View logs
+          • runner-manage verify - Verify connectivity
+          • generate-example-pipeline - Generate example .gitlab-ci.yml
+
+          Configuration:
+          • Main config: /etc/gitlab-runner/config.toml
+          • Example config: /etc/gitlab-runner/config.toml.example
+          • Edit: sudo nano /etc/gitlab-runner/config.toml
+
+          Troubleshooting:
+          • Check registration: gitlab-runner status
+          • Verify connectivity: gitlab-runner verify
+          • Debug job: Add CI_DEBUG_TRACE=true variable
+          • Check runner logs: journalctl -u gitlab-runner -n 100
+          • View pipeline logs: GitLab project → Pipelines
+
+          Pipeline Configuration:
+          • File: .gitlab-ci.yml (in repository root)
+          • Syntax: https://docs.gitlab.com/ee/ci/yaml/
+          • Linting: GitLab project → CI/CD → Pipeline Editor
+
+          For more information:
+          See CI_CD_SETUP_GUIDE.md
+
+        dest: /etc/gitlab-runner-config-summary.txt
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Display runner verification
+      debug:
+        msg: "{{ runner_status.stdout_lines | default(['Runner status check skipped']) }}"

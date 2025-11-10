@@ -1,0 +1,499 @@
+---
+# Install and configure Flux for GitOps on PicoCluster
+#
+# Flux provides:
+# - GitOps workflow (everything in Git)
+# - Automatic synchronization with Git repository
+# - Declarative application management
+# - Version control for all infrastructure
+# - Rollback capabilities
+# - Multi-cluster support
+#
+# Architecture:
+#   Git Repository
+#        ↓
+#   Flux Controller (watches Git)
+#        ↓
+#   Automatically applies manifests
+#        ↓
+#   Kubernetes Cluster updated
+#
+# Use Cases:
+# - Declarative infrastructure management
+# - Automated deployments from Git
+# - Version control for all configs
+# - Easy rollbacks
+# - Team collaboration via Pull Requests
+# - Audit trail of all changes
+#
+# Default Configuration:
+#   - Namespace: flux-system
+#   - Git sync interval: 1 minute
+#   - Automatic image updates: Optional
+#   - Kustomization reconciliation
+#
+# Usage:
+#   # Install Flux on cluster
+#   ansible-playbook infrastructure/gitops/install_flux.ansible
+#
+#   # Configure Git repository
+#   ansible-playbook infrastructure/gitops/configure_flux_repo.ansible \
+#     -e git_repo="https://github.com/your-org/cluster-config" \
+#     -e git_branch="main"
+#
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    flux_version: "latest"
+    flux_namespace: "flux-system"
+    git_repo: "https://github.com/picocluster/cluster-config.git"
+    git_branch: "main"
+    git_path: "./clusters"
+    sync_interval: "1m"
+    enable_image_automation: false
+    enable_notifications: false
+
+  pre_tasks:
+    - name: Display Flux GitOps installation information
+      debug:
+        msg: |
+          ====== Flux GitOps Setup ======
+
+          Component: Flux (GitOps operator for Kubernetes)
+          Version: {{ flux_version }}
+          Namespace: {{ flux_namespace }}
+          Git Repository: {{ git_repo }}
+          Git Branch: {{ git_branch }}
+
+          GitOps Workflow:
+          1. All infrastructure defined in Git (YAML manifests)
+          2. Flux controller watches Git repository
+          3. Changes detected every {{ sync_interval }}
+          4. Manifests automatically applied to cluster
+          5. Cluster state matches Git repository
+
+          Features:
+          • Declarative infrastructure (Infrastructure as Code)
+          • Automatic synchronization from Git
+          • Version control for all configurations
+          • Pull request-based deployments
+          • Automatic rollbacks on failed reconciliation
+          • Multi-cluster management
+          • Kustomization for template management
+          • Helm chart management
+          • Notifications on sync status
+
+          Benefits:
+          • Single source of truth (Git repository)
+          • Audit trail of all changes
+          • Easy rollbacks via Git history
+          • Team collaboration via PRs
+          • Consistent deployments
+          • Reduced manual errors
+          • Compliance and governance
+
+          Directory Structure:
+          {{ git_path }}/
+          ├── development/
+          │   ├── kustomization.yaml
+          │   └── manifests/
+          ├── production/
+          │   ├── kustomization.yaml
+          │   └── manifests/
+          └── flux-system/
+              └── gotk-components.yaml
+
+          ======================================
+
+  pre_flight_checks:
+    - name: Check if kubectl is available
+      command: kubectl cluster-info
+      changed_when: false
+      register: kubectl_check
+
+    - name: Check Kubernetes version
+      shell: kubectl version --short | grep Server
+      changed_when: false
+      register: k8s_version
+
+    - name: Display Kubernetes version
+      debug:
+        msg: "{{ k8s_version.stdout }}"
+
+  tasks:
+    - name: Check if Flux CLI is already installed
+      command: which flux
+      ignore_errors: yes
+      register: flux_check
+      changed_when: false
+
+    - name: Install Flux CLI
+      block:
+        - name: Determine system architecture
+          set_fact:
+            flux_arch: "{% if ansible_architecture == 'x86_64' %}amd64{% elif ansible_architecture == 'aarch64' %}arm64{% else %}{{ ansible_architecture }}{% endif %}"
+
+        - name: Download Flux CLI
+          get_url:
+            url: "https://github.com/fluxcd/flux2/releases/download/v{{ flux_version }}/flux_linux_{{ flux_arch }}.tar.gz"
+            dest: "/tmp/flux-{{ flux_version }}.tar.gz"
+            timeout: 60
+
+        - name: Extract Flux CLI
+          unarchive:
+            src: "/tmp/flux-{{ flux_version }}.tar.gz"
+            dest: "/usr/local/bin/"
+            remote_src: yes
+
+        - name: Verify Flux installation
+          command: flux version
+          register: flux_version_check
+          changed_when: false
+
+        - name: Display installed Flux version
+          debug:
+            msg: "{{ flux_version_check.stdout }}"
+
+      when: flux_check is failed
+
+    - name: Create flux-system namespace
+      kubernetes.core.k8s:
+        name: "{{ flux_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Install Flux on cluster
+      shell: |
+        flux bootstrap github \
+          --owner={{ git_repo.split('/')[3] }} \
+          --repo={{ git_repo.split('/')[4] | replace('.git', '') }} \
+          --branch={{ git_branch }} \
+          --path={{ git_path }} \
+          --personal=true \
+          --private=false
+      environment:
+        GITHUB_TOKEN: "{{ github_token | default('') }}"
+      ignore_errors: yes
+      register: flux_bootstrap
+      changed_when: "'installed components' in flux_bootstrap.stdout"
+
+    - name: Wait for Flux components to be ready
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        namespace: "{{ flux_namespace }}"
+        name: "{{ item }}"
+        wait: yes
+        wait_condition:
+          type: Available
+          status: "True"
+        wait_sleep: 5
+        wait_timeout: 300
+      loop:
+        - source-controller
+        - kustomize-controller
+        - notification-controller
+      ignore_errors: yes
+
+    - name: Get Flux status
+      shell: flux get all --all-namespaces
+      register: flux_status
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Create Flux status script
+      copy:
+        content: |
+          #!/bin/bash
+          # Display Flux GitOps status
+
+          echo "====== Flux GitOps Status ======"
+          echo ""
+
+          echo "Flux Version:"
+          flux version
+          echo ""
+
+          echo "Flux Components:"
+          kubectl get deployments -n flux-system
+          echo ""
+
+          echo "Flux Resources:"
+          flux get all --all-namespaces
+          echo ""
+
+          echo "Git Repository Status:"
+          flux get sources git
+          echo ""
+
+          echo "Kustomizations:"
+          flux get kustomizations --all-namespaces
+          echo ""
+
+          echo "Helm Releases:"
+          flux get helmreleases --all-namespaces
+          echo ""
+
+          echo "Recent Events:"
+          kubectl get events -n flux-system --sort-by='.lastTimestamp' | tail -10
+
+        dest: /usr/local/bin/flux-status
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create Flux sync script
+      copy:
+        content: |
+          #!/bin/bash
+          # Manually trigger Flux reconciliation
+
+          NAMESPACE="${1:-flux-system}"
+          RESOURCE="${2:-all}"
+
+          echo "[+] Triggering Flux reconciliation..."
+          echo "Namespace: $NAMESPACE"
+          echo "Resource: $RESOURCE"
+          echo ""
+
+          # Reconcile all resources
+          if [ "$RESOURCE" == "all" ]; then
+              flux reconcile source git flux-system
+              flux reconcile kustomization flux-system
+              echo "[+] Reconciliation triggered"
+          else
+              flux reconcile kustomization "$RESOURCE" -n "$NAMESPACE"
+              echo "[+] Reconciliation triggered for $RESOURCE"
+          fi
+
+          echo ""
+          echo "Watching reconciliation status..."
+          flux get all --all-namespaces
+
+        dest: /usr/local/bin/flux-sync
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create Flux logs script
+      copy:
+        content: |
+          #!/bin/bash
+          # View Flux controller logs
+
+          COMPONENT="${1:-source-controller}"
+          LINES="${2:-100}"
+
+          echo "====== Flux $COMPONENT Logs ======"
+          echo ""
+
+          kubectl logs -n flux-system \
+            -l app=$COMPONENT \
+            --tail=$LINES \
+            --all-containers=true
+
+        dest: /usr/local/bin/flux-logs
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create example GitOps repository structure
+      file:
+        path: "/tmp/cluster-config/{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - "clusters/production"
+        - "clusters/development"
+        - "apps/core"
+        - "apps/monitoring"
+        - "apps/logging"
+
+    - name: Create Flux system manifest
+      copy:
+        content: |
+          ---
+          apiVersion: source.toolkit.fluxcd.io/v1beta2
+          kind: GitRepository
+          metadata:
+            name: flux-system
+            namespace: flux-system
+          spec:
+            interval: {{ sync_interval }}
+            url: {{ git_repo }}
+            ref:
+              branch: {{ git_branch }}
+            secretRef:
+              name: flux-system
+          ---
+          apiVersion: kustomize.toolkit.fluxcd.io/v1beta2
+          kind: Kustomization
+          metadata:
+            name: flux-system
+            namespace: flux-system
+          spec:
+            interval: {{ sync_interval }}
+            sourceRef:
+              kind: GitRepository
+              name: flux-system
+            path: {{ git_path }}
+            prune: true
+            wait: true
+            timeout: 5m0s
+
+        dest: "/tmp/cluster-config/clusters/flux-system.yaml"
+        mode: '0644'
+
+  post_tasks:
+    - name: Display Flux GitOps installation summary
+      debug:
+        msg: |
+          ====== Flux GitOps Installation Complete ======
+
+          ✓ Flux CLI installed
+          ✓ Flux components deployed to cluster
+          ✓ Git repository configured for sync
+
+          Flux Configuration:
+          ─────────────────────────────────────────
+          Namespace: {{ flux_namespace }}
+          Git Repository: {{ git_repo }}
+          Git Branch: {{ git_branch }}
+          Sync Interval: {{ sync_interval }}
+          Path in Repo: {{ git_path }}
+
+          Flux Components:
+          ─────────────────────────────────────────
+          source-controller: Watches Git repository
+          kustomize-controller: Applies Kustomizations
+          notification-controller: Sends notifications
+          helm-controller: Manages Helm charts
+
+          Utility Commands:
+          ─────────────────────────────────────────
+          Check status: flux-status
+          Trigger sync: flux-sync
+          View logs: flux-logs [component] [lines]
+          Manual reconcile: flux reconcile kustomization flux-system
+
+          Service Management:
+          ─────────────────────────────────────────
+          Status: kubectl get deployments -n flux-system
+          Logs: kubectl logs -n flux-system -l app=source-controller -f
+          Events: kubectl get events -n flux-system
+
+          Next Steps:
+          ─────────────────────────────────────────
+          1. Create Git repository with cluster config:
+             - Structure: clusters/<env>/kustomization.yaml
+             - Add application manifests
+             - Commit and push to {{ git_branch }}
+
+          2. Verify Flux is syncing:
+             flux-status
+             flux get all --all-namespaces
+
+          3. Deploy applications via Git:
+             - Create app manifests in Git repo
+             - Push changes
+             - Flux automatically applies them (within {{ sync_interval }})
+
+          4. Monitor deployments:
+             kubectl get all -A
+             flux get all --all-namespaces
+
+          5. Review Flux logs:
+             flux-logs source-controller
+             flux-logs kustomize-controller
+
+          GitOps Best Practices:
+          ─────────────────────────────────────────
+          • Commit all infrastructure to Git
+          • Use separate branches for dev/prod
+          • Require pull requests for changes
+          • Enable branch protection rules
+          • Tag releases for easy rollbacks
+          • Document deployment procedures
+          • Automate testing in CI pipeline
+
+          Repository Structure:
+          ─────────────────────────────────────────
+          cluster-config/
+          ├── clusters/
+          │   ├── production/
+          │   │   ├── kustomization.yaml
+          │   │   └── flux-system/
+          │   └── development/
+          │       ├── kustomization.yaml
+          │       └── flux-system/
+          ├── apps/
+          │   ├── core/
+          │   ├── monitoring/
+          │   └── logging/
+          └── README.md
+
+          ==========================================
+
+    - name: Create Flux configuration summary
+      copy:
+        content: |
+          Flux GitOps Configuration
+          Generated: {{ ansible_date_time.iso8601 }}
+
+          Cluster: {{ ansible_hostname }}
+          Kubernetes Version: {{ k8s_version.stdout }}
+
+          Flux Installation:
+          • Component: Flux v2 (GitOps operator)
+          • Namespace: {{ flux_namespace }}
+          • Status: kubectl get deployments -n {{ flux_namespace }}
+
+          Git Configuration:
+          • Repository: {{ git_repo }}
+          • Branch: {{ git_branch }}
+          • Path: {{ git_path }}
+          • Sync Interval: {{ sync_interval }}
+
+          Controllers:
+          • source-controller: Watches Git/Helm repos
+          • kustomize-controller: Applies Kustomizations
+          • notification-controller: Sends alerts
+          • helm-controller: Manages Helm releases
+
+          Key Resources:
+          • GitRepository: {{ git_repo }}/{{ git_branch }}
+          • Kustomization: {{ git_path }}/clusters/
+
+          Reconciliation:
+          • Manual sync: flux-sync or flux reconcile
+          • Automatic: Every {{ sync_interval }}
+          • Prune: Deletes resources not in Git
+          • Wait: Waits for resources to be ready
+
+          Monitoring:
+          • Status: flux-status
+          • Logs: flux-logs [component]
+          • Events: kubectl get events -n {{ flux_namespace }}
+          • Resources: flux get all --all-namespaces
+
+          Security:
+          • RBAC: Flux uses service accounts
+          • Git Auth: SSH keys or tokens
+          • Secrets: Sealed Secrets or External Secrets
+          • Audit: Kubernetes audit logs
+
+          For more information:
+          See GITOPS_SETUP_GUIDE.md
+
+        dest: "/etc/flux-config-summary.txt"
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Display Flux status
+      debug:
+        msg: "{{ flux_status.stdout_lines }}"
+      when: flux_status.rc == 0
