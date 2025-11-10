@@ -1,0 +1,445 @@
+---
+# Install and configure Promtail on cluster nodes for log shipping to Loki
+#
+# Promtail is the log shipper that:
+# - Reads logs from system and applications
+# - Parses and labels logs
+# - Ships to Loki for aggregation and analysis
+#
+# Features:
+# - Systemd journal scraping
+# - Kubernetes pod log scraping (if K3s installed)
+# - Static file tailing for applications
+# - JSON and regex parsing
+# - Automatic label assignment
+#
+# Usage:
+#   # Deploy to all nodes
+#   ansible-playbook infrastructure/logging/install_promtail.ansible
+#
+#   # Deploy to specific nodes
+#   ansible-playbook infrastructure/logging/install_promtail.ansible -l worker
+#
+#   # Deploy with custom Loki server
+#   ansible-playbook infrastructure/logging/install_promtail.ansible \
+#     -e loki_server="10.1.10.245" \
+#     -e loki_port=3100
+#
+# Default configuration:
+#   - HTTP server: 0.0.0.0:9080
+#   - Log level: info
+#   - Systemd journal scraping enabled
+#   - Kubernetes scraping (if K3s detected)
+#   - Application logs from /var/log/applications/*.log
+#
+# Loki server detection order:
+#   1. Use -e loki_server if provided
+#   2. Use 'logging' inventory group
+#   3. Use 'monitoring' inventory group
+#   4. Fall back to localhost
+#
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    promtail_version: "2.8.0"
+    promtail_port: 9080
+    promtail_user: "promtail"
+    promtail_group: "promtail"
+    promtail_home: "/var/lib/promtail"
+    promtail_config_dir: "/etc/promtail"
+    promtail_log_dir: "/var/log/promtail"
+    loki_server: "{{ groups.get('logging', [groups.get('monitoring', ['localhost'])[0]])[0] | default('localhost') }}"
+    loki_port: 3100
+
+  pre_tasks:
+    - name: Display Promtail installation information
+      debug:
+        msg: |
+          ====== Promtail Log Shipper Setup ======
+
+          Version: {{ promtail_version }}
+          Configuration: {{ promtail_config_dir }}/config.yml
+          Log Shipper Port: 0.0.0.0:{{ promtail_port }}/TCP
+          Loki Server: {{ loki_server }}:{{ loki_port }}
+
+          Log Sources:
+          • Systemd journal (last 24h)
+          • Kubernetes pods (if K3s detected)
+          • Syslog (/var/log/syslog)
+          • Application logs (/var/log/applications/*.log)
+
+          Data Flow:
+          This Node → Promtail :{{ promtail_port }} → Loki :{{ loki_port }} → Grafana
+
+          ======================================
+
+  tasks:
+    - name: Determine system architecture
+      set_fact:
+        promtail_arch: "{% if ansible_architecture == 'x86_64' %}amd64{% elif ansible_architecture == 'aarch64' %}arm64{% else %}{{ ansible_architecture }}{% endif %}"
+
+    - name: Create Promtail system user
+      user:
+        name: "{{ promtail_user }}"
+        system: yes
+        shell: /bin/false
+        home: "{{ promtail_home }}"
+        comment: "Promtail user"
+
+    - name: Create Promtail directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ promtail_user }}"
+        group: "{{ promtail_group }}"
+        mode: '0755'
+      loop:
+        - "{{ promtail_home }}"
+        - "{{ promtail_config_dir }}"
+        - "{{ promtail_log_dir }}"
+        - /var/log/applications
+
+    - name: Check if Promtail is already installed
+      shell: which promtail
+      ignore_errors: yes
+      register: promtail_check
+      changed_when: false
+
+    - name: Download and install Promtail
+      block:
+        - name: Download Promtail binary
+          get_url:
+            url: "https://github.com/grafana/loki/releases/download/v{{ promtail_version }}/promtail-linux-{{ promtail_arch }}.zip"
+            dest: "/tmp/promtail-{{ promtail_version }}.zip"
+            timeout: 60
+
+        - name: Extract Promtail
+          unarchive:
+            src: "/tmp/promtail-{{ promtail_version }}.zip"
+            dest: "/tmp/"
+            remote_src: yes
+
+        - name: Install Promtail binary
+          shell: |
+            cp /tmp/promtail-linux-{{ promtail_arch }} /usr/local/bin/promtail
+            chmod +x /usr/local/bin/promtail
+
+        - name: Verify installation
+          shell: promtail -version
+          register: promtail_version_check
+          changed_when: false
+
+        - name: Display installed version
+          debug:
+            msg: "{{ promtail_version_check.stdout }}"
+
+      when: promtail_check is failed
+
+    - name: Detect Kubernetes cluster
+      shell: kubectl cluster-info 2>/dev/null | grep -q "Kubernetes master" && echo "true" || echo "false"
+      ignore_errors: yes
+      register: k8s_detected
+      changed_when: false
+
+    - name: Create Promtail configuration
+      copy:
+        content: |
+          # Promtail Configuration for PicoCluster
+          # Log shipping to Loki
+
+          server:
+            http_listen_port: {{ promtail_port }}
+            log_level: info
+            log_format: json
+
+          positions:
+            filename: /tmp/promtail-positions.yaml
+
+          clients:
+            - url: http://{{ loki_server }}:{{ loki_port }}/loki/api/v1/push
+
+          scrape_configs:
+            # System logs from Systemd journal
+            - job_name: systemd
+              journal:
+                max_age: 24h
+                labels:
+                  job: systemd-journal
+                  hostname: "{{ ansible_hostname }}"
+                  instance: "{{ ansible_default_ipv4.address }}"
+              relabel_configs:
+                - source_labels: ['__journal__systemd_unit']
+                  target_label: 'unit'
+                - source_labels: ['__journal__priority']
+                  target_label: 'priority'
+                - source_labels: ['__journal_hostname']
+                  target_label: 'host'
+              pipeline_stages:
+                - json:
+                    expressions:
+                      message: MESSAGE
+                      priority: PRIORITY
+                      unit: _SYSTEMD_UNIT
+
+            # Kubernetes logs (if K3s installed)
+            {% if k8s_detected.stdout == "true" %}
+            - job_name: kubernetes
+              kubernetes_sd_configs:
+                - role: pod
+              relabel_configs:
+                - source_labels: [__meta_kubernetes_pod_node_name]
+                  target_label: node
+                - source_labels: [__meta_kubernetes_namespace]
+                  target_label: namespace
+                - source_labels: [__meta_kubernetes_pod_name]
+                  target_label: pod
+                - source_labels: [__meta_kubernetes_pod_container_name]
+                  target_label: container
+              pipeline_stages:
+                - json:
+                    expressions:
+                      msg: message
+                      timestamp: timestamp
+                - labels:
+                    msg: ""
+            {% endif %}
+
+            # Syslog
+            - job_name: syslog
+              static_configs:
+                - targets:
+                    - localhost
+                  labels:
+                    job: syslog
+                    hostname: "{{ ansible_hostname }}"
+                    instance: "{{ ansible_default_ipv4.address }}"
+                    __path__: /var/log/syslog
+              pipeline_stages:
+                - regex:
+                    expression: '(?P<timestamp>.*?) (?P<hostname>\S+) (?P<process>\S+)(\[(?P<pid>\d+)\])?(?P<content>.*)'
+                - labels:
+                    hostname: ""
+                    process: ""
+                    pid: ""
+
+            # Application logs
+            - job_name: applications
+              static_configs:
+                - targets:
+                    - localhost
+                  labels:
+                    job: applications
+                    hostname: "{{ ansible_hostname }}"
+                    instance: "{{ ansible_default_ipv4.address }}"
+                    __path__: /var/log/applications/*.log
+              pipeline_stages:
+                - json:
+                    expressions:
+                      level: level
+                      message: message
+                - labels:
+                    level: ""
+
+            # Container logs if Docker/Containerd detected
+            {% if ansible_facts.services.get('docker') is defined or ansible_facts.services.get('containerd') is defined %}
+            - job_name: containers
+              static_configs:
+                - targets:
+                    - localhost
+                  labels:
+                    job: containers
+                    hostname: "{{ ansible_hostname }}"
+                    instance: "{{ ansible_default_ipv4.address }}"
+                    __path__: /var/lib/docker/containers/*/*-json.log
+              pipeline_stages:
+                - json:
+                    expressions:
+                      log: log
+                      stream: stream
+                - labels:
+                    stream: ""
+            {% endif %}
+
+          # Metrics exposure (optional)
+          metrics:
+            enabled: true
+            wal_enabled: false
+
+        dest: "{{ promtail_config_dir }}/config.yml"
+        owner: root
+        group: root
+        mode: '0644'
+      register: promtail_config
+
+    - name: Create Promtail systemd service
+      copy:
+        content: |
+          [Unit]
+          Description=Promtail Log Shipper
+          Wants=network-online.target
+          After=network-online.target
+
+          [Service]
+          Type=simple
+          User={{ promtail_user }}
+          Group={{ promtail_group }}
+          ExecStart=/usr/local/bin/promtail -config.file={{ promtail_config_dir }}/config.yml
+          Restart=always
+          RestartSec=5
+
+          # Resource limits
+          LimitNOFILE=65536
+          LimitNPROC=512
+
+          SyslogIdentifier=promtail
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/promtail.service
+        owner: root
+        group: root
+        mode: '0644'
+      register: promtail_service
+
+    - name: Enable and start Promtail
+      systemd:
+        daemon_reload: yes
+        name: promtail
+        enabled: yes
+        state: restarted
+      when: promtail_service is changed or promtail_config is changed
+
+    - name: Start Promtail if not already running
+      systemd:
+        name: promtail
+        state: started
+      changed_when: false
+
+    - name: Wait for Promtail to be ready
+      uri:
+        url: "http://localhost:{{ promtail_port }}/metrics"
+        method: GET
+        status_code: 200
+      retries: 10
+      delay: 1
+      changed_when: false
+
+    - name: Test Loki connectivity
+      uri:
+        url: "http://{{ loki_server }}:{{ loki_port }}/ready"
+        method: GET
+        status_code: 200
+      retries: 5
+      delay: 2
+      changed_when: false
+      ignore_errors: yes
+      register: loki_connectivity
+
+  post_tasks:
+    - name: Display Promtail access information
+      debug:
+        msg: |
+          ====== Promtail Installation Complete ======
+
+          ✓ Promtail installed and running
+          ✓ Listening on 0.0.0.0:{{ promtail_port }}/TCP
+          ✓ Shipping logs to Loki at {{ loki_server }}:{{ loki_port }}
+
+          Service Management:
+          ─────────────────────────────────────────
+          Status:  sudo systemctl status promtail
+          Restart: sudo systemctl restart promtail
+          Logs:    sudo journalctl -u promtail -f
+          Config:  {{ promtail_config_dir }}/config.yml
+
+          Metrics and Debugging:
+          ─────────────────────────────────────────
+          Promtail metrics: http://{{ ansible_default_ipv4.address }}:{{ promtail_port }}/metrics
+          Log position file: /tmp/promtail-positions.yaml
+
+          Log sources configured:
+          • Systemd journal (last 24h)
+          {% if k8s_detected.stdout == "true" %}
+          • Kubernetes pods
+          {% endif %}
+          • Syslog (/var/log/syslog)
+          • Application logs (/var/log/applications/*.log)
+          {% if ansible_facts.services.get('docker') is defined %}
+          • Docker container logs
+          {% endif %}
+
+          {% if loki_connectivity is succeeded %}
+          Loki Connectivity: ✓ CONNECTED
+          {% else %}
+          Loki Connectivity: ⚠ UNAVAILABLE (will retry automatically)
+          {% endif %}
+
+          Query Logs in Grafana:
+          ─────────────────────────────────────────
+          1. Navigate to Grafana (http://monitoring.cluster.local:3000)
+          2. Go to Explore → Select Loki datasource
+          3. Use LogQL queries:
+             {job="systemd-journal", hostname="{{ ansible_hostname }}"}
+             {namespace="default"} | json
+             {job="applications"} | json level="error"
+
+          ==========================================
+
+    - name: Create Promtail configuration summary
+      copy:
+        content: |
+          Promtail Log Shipper Configuration
+          Generated: {{ ansible_date_time.iso8601 }}
+
+          Hostname: {{ ansible_hostname }}
+          IP Address: {{ ansible_default_ipv4.address }}
+
+          Installed Version: {{ promtail_version }}
+
+          Configuration:
+          • HTTP Port: {{ promtail_port }}/TCP
+          • Loki Server: {{ loki_server }}:{{ loki_port }}
+          • Log Position File: /tmp/promtail-positions.yaml
+          • Configuration File: {{ promtail_config_dir }}/config.yml
+
+          Log Sources:
+          • Systemd Journal: Last 24 hours
+          • Syslog: /var/log/syslog
+          • Applications: /var/log/applications/*.log
+          {% if k8s_detected.stdout == "true" %}
+          • Kubernetes Pods: Discovered pods
+          {% endif %}
+          {% if ansible_facts.services.get('docker') is defined %}
+          • Docker Containers: /var/lib/docker/containers/*/
+          {% endif %}
+
+          Service Management:
+          • Start:   systemctl start promtail
+          • Stop:    systemctl stop promtail
+          • Restart: systemctl restart promtail
+          • Status:  systemctl status promtail
+          • Logs:    journalctl -u promtail -f
+
+          Health Check:
+          curl http://{{ ansible_default_ipv4.address }}:{{ promtail_port }}/metrics
+
+          Query Examples:
+          # All logs on this host
+          {hostname="{{ ansible_hostname }}"}
+
+          # All systemd journal entries
+          {job="systemd-journal", hostname="{{ ansible_hostname }}"}
+
+          # Application errors
+          {job="applications"} | json level="error"
+
+          # Kubernetes pods
+          {namespace="default", hostname="{{ ansible_hostname }}"}
+
+        dest: "{{ promtail_config_dir }}/CONFIGURATION.txt"
+        owner: root
+        group: root
+        mode: '0644'
