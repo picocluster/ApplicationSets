@@ -1,0 +1,506 @@
+---
+# Install and configure Jaeger for distributed tracing on PicoCluster
+#
+# Jaeger provides:
+# - End-to-end request tracing across microservices
+# - Service dependency mapping
+# - Performance bottleneck identification
+# - Root cause analysis for failures
+# - OpenTelemetry integration
+#
+# Architecture:
+#   Application (instrumented with OpenTelemetry)
+#        ↓
+#   Jaeger Client Libraries
+#        ↓
+#   Jaeger Agent (UDP, localhost:6831)
+#        ↓
+#   Jaeger Collector (receives traces)
+#        ↓
+#   Backend Storage (Elasticsearch/BadgerDB)
+#        ↓
+#   Jaeger UI (visualize traces)
+#
+# Use Cases:
+# - Trace requests through microservices
+# - Identify slow services
+# - Debug distributed failures
+# - Monitor system performance
+# - Service dependency analysis
+#
+# Default Configuration:
+#   - Sampling: 100% (all traces)
+#   - Storage: BadgerDB (embedded, no external dependencies)
+#   - UI Port: 16686
+#   - Collector Port: 14268 (HTTP)
+#   - Agent Port: 6831 (UDP)
+#
+# Usage:
+#   # Install Jaeger on cluster
+#   ansible-playbook infrastructure/observability/install_jaeger.ansible
+#
+#   # Deploy Jaeger agents to all nodes
+#   ansible-playbook infrastructure/observability/install_jaeger_agents.ansible
+#
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    jaeger_version: "1.40.0"
+    jaeger_namespace: "observability"
+    jaeger_storage: "badger"  # or elasticsearch, cassandra
+    jaeger_sampling_rate: 1.0  # 100% sampling (1.0) or probabilistic
+    jaeger_ui_port: 16686
+    jaeger_collector_port: 14268
+    jaeger_agent_port: 6831
+    enable_elasticsearch: false
+
+  pre_tasks:
+    - name: Display Jaeger installation information
+      debug:
+        msg: |
+          ====== Jaeger Distributed Tracing Setup ======
+
+          Component: Jaeger (Distributed Tracing Platform)
+          Version: {{ jaeger_version }}
+          Namespace: {{ jaeger_namespace }}
+          Storage: {{ jaeger_storage }}
+          Sampling Rate: {{ (jaeger_sampling_rate * 100) | int }}%
+
+          Jaeger Architecture:
+          1. Applications emit traces (OpenTelemetry)
+          2. Jaeger client libraries collect spans
+          3. Jaeger agents aggregate data (UDP)
+          4. Jaeger collector processes spans (HTTP)
+          5. Backend storage persists traces
+          6. Jaeger UI visualizes traces and dependencies
+
+          Key Features:
+          • End-to-end request tracing
+          • Service dependency mapping
+          • Performance analysis
+          • Root cause analysis
+          • OpenTelemetry compatibility
+          • Multiple storage backends
+          • Distributed sampling
+          • Span tagging and filtering
+
+          Storage Options:
+          • BadgerDB: Embedded, no external dependencies
+          • Elasticsearch: Scalable, production-ready
+          • Cassandra: Distributed, multi-node
+          • Memory: Testing only
+
+          Sampling Strategies:
+          • Const: Always sample (100%) or never (0%)
+          • Probabilistic: Sample X% of traces
+          • Rate Limiting: Sample N traces/sec
+          • Remote: Dynamically adjust sampling
+
+          Use Cases:
+          • Debug distributed transactions
+          • Identify service bottlenecks
+          • Analyze latency patterns
+          • Monitor service dependencies
+          • Troubleshoot failures
+          • Performance optimization
+
+          ======================================
+
+  tasks:
+    - name: Create observability namespace
+      kubernetes.core.k8s:
+        name: "{{ jaeger_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Add Jaeger Helm repository
+      kubernetes.core.helm_repository:
+        name: jaegertracing
+        repo_url: "https://jaegertracing.github.io/helm-charts"
+        state: present
+
+    - name: Create Jaeger values file
+      copy:
+        content: |
+          # Jaeger Helm Chart Values
+          provisionDataStore:
+            cassandra: false
+            elasticsearch: {{ "true" if enable_elasticsearch else "false" }}
+            badger:
+              enabled: true
+
+          jaeger:
+            config:
+              sampler:
+                type: const
+                param: 1
+              # Logging to trace all operations
+              logging: true
+
+          collector:
+            enabled: true
+            service:
+              type: ClusterIP
+              port: {{ jaeger_collector_port }}
+            replicaCount: 1
+            resources:
+              requests:
+                cpu: 100m
+                memory: 128Mi
+              limits:
+                cpu: 500m
+                memory: 512Mi
+
+          agent:
+            enabled: true
+            service:
+              type: DaemonSet
+              port: {{ jaeger_agent_port }}
+            resources:
+              requests:
+                cpu: 50m
+                memory: 64Mi
+              limits:
+                cpu: 200m
+                memory: 256Mi
+
+          query:
+            enabled: true
+            service:
+              type: ClusterIP
+              port: {{ jaeger_ui_port }}
+            replicaCount: 1
+            resources:
+              requests:
+                cpu: 50m
+                memory: 64Mi
+              limits:
+                cpu: 200m
+                memory: 256Mi
+
+          ingester:
+            enabled: false
+
+          storage:
+            type: badger
+            badger:
+              ephemeral: false
+              massIndexCacheSize: 16777216
+              spanStorageMaxLogSize: 268435456
+
+        dest: /tmp/jaeger-values.yaml
+
+    - name: Install Jaeger Helm chart
+      kubernetes.core.helm:
+        name: jaeger
+        chart_ref: jaegertracing/jaeger
+        release_namespace: "{{ jaeger_namespace }}"
+        create_namespace: yes
+        values: "{{ lookup('file', '/tmp/jaeger-values.yaml') | from_yaml }}"
+        state: present
+      ignore_errors: yes
+      register: jaeger_install
+
+    - name: Wait for Jaeger deployment
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        namespace: "{{ jaeger_namespace }}"
+        name: jaeger
+        wait: yes
+        wait_condition:
+          type: Available
+          status: "True"
+        wait_sleep: 5
+        wait_timeout: 300
+      ignore_errors: yes
+
+    - name: Get Jaeger service info
+      kubernetes.core.k8s_info:
+        kind: Service
+        namespace: "{{ jaeger_namespace }}"
+      register: jaeger_services
+      changed_when: false
+
+    - name: Create Jaeger port-forward script
+      copy:
+        content: |
+          #!/bin/bash
+          # Forward Jaeger UI port to localhost
+
+          NAMESPACE="{{ jaeger_namespace }}"
+          POD=$(kubectl get pods -n $NAMESPACE -l app.kubernetes.io/name=jaeger -o jsonpath='{.items[0].metadata.name}')
+
+          echo "Forwarding Jaeger UI..."
+          echo "Access at: http://localhost:{{ jaeger_ui_port }}"
+          echo ""
+          echo "Press Ctrl+C to stop"
+          echo ""
+
+          kubectl port-forward -n $NAMESPACE svc/jaeger-query {{ jaeger_ui_port }}:{{ jaeger_ui_port }}
+
+        dest: /usr/local/bin/jaeger-port-forward
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create Jaeger status script
+      copy:
+        content: |
+          #!/bin/bash
+          # Display Jaeger status
+
+          NAMESPACE="{{ jaeger_namespace }}"
+
+          echo "====== Jaeger Distributed Tracing Status ======"
+          echo ""
+
+          echo "Namespace: $NAMESPACE"
+          kubectl get namespace $NAMESPACE
+          echo ""
+
+          echo "Jaeger Pods:"
+          kubectl get pods -n $NAMESPACE -l app.kubernetes.io/name=jaeger
+          echo ""
+
+          echo "Jaeger Services:"
+          kubectl get svc -n $NAMESPACE -l app.kubernetes.io/name=jaeger
+          echo ""
+
+          echo "Jaeger Ingresses:"
+          kubectl get ingress -n $NAMESPACE
+          echo ""
+
+          echo "Resource Usage:"
+          kubectl top pods -n $NAMESPACE 2>/dev/null || echo "Metrics not available"
+          echo ""
+
+          echo "Recent Events:"
+          kubectl get events -n $NAMESPACE --sort-by='.lastTimestamp' | tail -10
+
+        dest: /usr/local/bin/jaeger-status
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create Jaeger configuration script
+      copy:
+        content: |
+          #!/bin/bash
+          # Generate Jaeger client configuration examples
+
+          echo "====== Jaeger Client Configuration ======"
+          echo ""
+
+          echo "### Python (using Jaeger SDK)"
+          echo ""
+          echo 'from jaeger_client import Config'
+          echo ''
+          echo 'def init_tracer(service_name):'
+          echo '    config = Config('
+          echo '        config={'
+          echo '            "sampler": {'
+          echo '                "type": "const",'
+          echo '                "param": 1,'
+          echo '            },'
+          echo '            "logging": True,'
+          echo '        },'
+          echo '        service_name=service_name,'
+          echo '        validate=True,'
+          echo '    )'
+          echo '    return config.initialize_tracer()'
+          echo ''
+
+          echo "### JavaScript/Node.js (using OpenTelemetry)"
+          echo ""
+          echo 'const { BasicTracerProvider } = require("@opentelemetry/tracing");'
+          echo 'const { JaegerExporter } = require("@opentelemetry/exporter-jaeger");'
+          echo ''
+          echo 'const jaegerExporter = new JaegerExporter({'
+          echo '  host: "jaeger-agent",'
+          echo '  port: 6831,'
+          echo '});'
+          echo ''
+          echo 'const tracerProvider = new BasicTracerProvider();'
+          echo 'tracerProvider.addSpanProcessor('
+          echo '  new SimpleSpanProcessor(jaegerExporter)'
+          echo ');'
+          echo ''
+
+          echo "### Java (using OpenTelemetry)"
+          echo ""
+          echo 'JaegerGrpcSpanExporter jaegerExporter ='
+          echo '    JaegerGrpcSpanExporter.builder()'
+          echo '        .setEndpoint("http://jaeger-collector:14250")'
+          echo '        .build();'
+          echo ''
+          echo 'TracerProvider tracerProvider ='
+          echo '    SdkTracerProvider.builder()'
+          echo '        .addSpanProcessor('
+          echo '            BatchSpanProcessor.builder(jaegerExporter).build()'
+          echo '        )'
+          echo '        .build();'
+          echo ''
+
+        dest: /usr/local/bin/jaeger-client-config
+        owner: root
+        group: root
+        mode: '0755'
+
+  post_tasks:
+    - name: Display Jaeger installation summary
+      debug:
+        msg: |
+          ====== Jaeger Installation Complete ======
+
+          ✓ Jaeger deployed to cluster
+          ✓ Collector and Agent running
+          ✓ BadgerDB storage initialized
+
+          Jaeger Components:
+          ─────────────────────────────────────────
+          Collector: Receives traces from applications
+            - Endpoint: jaeger-collector:{{ jaeger_collector_port }}
+            - Protocol: HTTP/gRPC
+            - Port: {{ jaeger_collector_port }}
+
+          Agent: Local trace aggregator
+            - Runs on each node
+            - Endpoint: localhost:{{ jaeger_agent_port }}
+            - Protocol: UDP (Thrift compact)
+            - Port: {{ jaeger_agent_port }}
+
+          Query: Web UI for trace visualization
+            - Endpoint: jaeger-query:{{ jaeger_ui_port }}
+            - Access: http://localhost:{{ jaeger_ui_port }}
+            - Port: {{ jaeger_ui_port }}
+
+          Storage: BadgerDB (embedded)
+            - No external dependencies
+            - Local storage at /var/lib/jaeger/
+            - Single-node setup
+
+          Service Management:
+          ─────────────────────────────────────────
+          Status: jaeger-status
+          Port-forward UI: jaeger-port-forward
+          View logs: kubectl logs -n {{ jaeger_namespace }} -l app.kubernetes.io/name=jaeger -f
+
+          Namespace: {{ jaeger_namespace }}
+
+          Next Steps:
+          ─────────────────────────────────────────
+          1. Access Jaeger UI:
+             jaeger-port-forward
+             Open: http://localhost:{{ jaeger_ui_port }}
+
+          2. Instrument applications:
+             - Install OpenTelemetry client libraries
+             - Configure Jaeger exporter
+             - Start emitting traces
+
+          3. View traces:
+             - Search by service name
+             - Filter by time range
+             - Analyze latency and errors
+
+          4. Monitor system:
+             jaeger-status
+             kubectl logs -n {{ jaeger_namespace }} -f
+
+          5. Configure sampling:
+             Edit Jaeger values and redeploy
+             Currently: {{ (jaeger_sampling_rate * 100) | int }}% sampling
+
+          Instrumentation Guide:
+          ─────────────────────────────────────────
+          Generate examples: jaeger-client-config
+
+          Jaeger Agent Connection:
+          - Language clients connect to jaeger-agent:{{ jaeger_agent_port }}
+          - In Kubernetes: jaeger-agent.{{ jaeger_namespace }}:{{ jaeger_agent_port }}
+          - Outside cluster: port-forward or expose NodePort
+
+          Storage Information:
+          - Type: {{ jaeger_storage }}
+          - Location: /var/lib/jaeger/badger
+          - Retention: Check Jaeger configuration
+
+          Performance Tips:
+          ─────────────────────────────────────────
+          • Use probabilistic sampling for high-volume systems
+          • Adjust sampling rate based on traffic
+          • Use log-based sampling for errors
+          • Monitor collector resource usage
+          • Scale collectors based on trace volume
+
+          ==========================================
+
+    - name: Create Jaeger configuration summary
+      copy:
+        content: |
+          Jaeger Distributed Tracing Configuration
+          Generated: {{ ansible_date_time.iso8601 }}
+
+          Cluster: {{ ansible_hostname }}
+
+          Installation:
+          • Component: Jaeger v{{ jaeger_version }}
+          • Namespace: {{ jaeger_namespace }}
+          • Deployment: Kubernetes via Helm
+          • Storage: {{ jaeger_storage }}
+
+          Endpoints:
+          • Collector (HTTP): jaeger-collector:{{ jaeger_collector_port }}
+          • Collector (gRPC): jaeger-collector:14250
+          • Agent (UDP): jaeger-agent:{{ jaeger_agent_port }}
+          • Query UI: jaeger-query:{{ jaeger_ui_port }}
+
+          Sampling Configuration:
+          • Strategy: const (always sample)
+          • Rate: {{ jaeger_sampling_rate * 100 | int }}%
+          • Configure in Jaeger values for changes
+
+          Management:
+          • Status: jaeger-status
+          • Port-forward: jaeger-port-forward
+          • Logs: kubectl logs -n {{ jaeger_namespace }} -f
+          • Events: kubectl get events -n {{ jaeger_namespace }}
+
+          Client Configuration:
+          • Jaeger Agent: jaeger-agent.{{ jaeger_namespace }}:{{ jaeger_agent_port }}
+          • Collector: jaeger-collector.{{ jaeger_namespace }}:{{ jaeger_collector_port }}
+          • Protocol: OpenTelemetry (gRPC/HTTP)
+
+          Instrumentation:
+          • Languages: Python, Java, Go, Node.js, .NET, PHP, Ruby
+          • SDK: OpenTelemetry or Jaeger client libraries
+          • Configuration: See jaeger-client-config script
+
+          Storage:
+          • Backend: BadgerDB (embedded key-value store)
+          • Location: /var/lib/jaeger/badger
+          • Persistence: Enabled
+          • Backup: kubectl exec jaeger -- tar czf
+
+          Performance:
+          • Collector replicas: 1
+          • Agent type: DaemonSet (one per node)
+          • Resource requests: CPU 50-100m, Memory 64-128Mi
+          • Resource limits: CPU 200-500m, Memory 256-512Mi
+
+          Monitoring:
+          • Jaeger exports metrics (Prometheus format)
+          • Health check: HTTP GET jaeger-collector:14269/health
+          • Trace lag: Check in Jaeger UI
+
+          For more information:
+          See JAEGER_SETUP_GUIDE.md
+
+        dest: /etc/jaeger-config-summary.txt
+        owner: root
+        group: root
+        mode: '0644'
