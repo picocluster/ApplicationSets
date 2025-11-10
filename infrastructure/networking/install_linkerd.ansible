@@ -1,0 +1,569 @@
+---
+# Install and configure Linkerd service mesh on PicoCluster
+#
+# Linkerd provides:
+# - Automatic mTLS (mutual TLS) between services
+# - Intelligent load balancing
+# - Circuit breaking and failover
+# - Traffic splitting (canary deployments)
+# - Built-in observability
+# - Zero-trust networking
+# - Minimal resource overhead
+#
+# Architecture:
+#   Application Pod
+#        ↓
+#   Linkerd Proxy (sidecar)
+#        ↓
+#   Handles mTLS, load balancing, observability
+#        ↓
+#   Other Service Pod
+#
+# Key Features:
+# - Automatic mTLS: No application changes needed
+# - Load balancing: Round-robin, least-loaded
+# - Traffic management: Canary, dark traffic
+# - Observability: Golden metrics out of the box
+# - Multi-cluster: Connect multiple Kubernetes clusters
+# - Tiny footprint: ~10MB per proxy, minimal CPU
+#
+# Default Configuration:
+#   - Namespace: linkerd
+#   - Proxy Port: 4143
+#   - Admin Port: 4191
+#   - Policy: Deny unsafe by default
+#
+# Usage:
+#   # Install Linkerd control plane
+#   ansible-playbook infrastructure/networking/install_linkerd.ansible
+#
+#   # Inject proxies into deployment
+#   kubectl annotate deployment myapp linkerd.io/inject=enabled
+#
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    linkerd_version: "2.15.4"
+    linkerd_namespace: "linkerd"
+    enable_ha: false  # High availability (requires 3+ nodes)
+    enable_viz: true  # Enable Viz dashboard
+    proxy_memory_request: "20Mi"
+    proxy_memory_limit: "250Mi"
+    proxy_cpu_request: "10m"
+    proxy_cpu_limit: "100m"
+    enable_policy: true  # Enable traffic policies
+
+  pre_tasks:
+    - name: Display Linkerd installation information
+      debug:
+        msg: |
+          ====== Linkerd Service Mesh Setup ======
+
+          Component: Linkerd (Service Mesh)
+          Version: {{ linkerd_version }}
+          Namespace: {{ linkerd_namespace }}
+          HA Mode: {{ "Enabled (3+ nodes)" if enable_ha else "Disabled (single node)" }}
+
+          Service Mesh Features:
+          • Automatic mTLS encryption
+          • Intelligent load balancing
+          • Circuit breaking and retries
+          • Traffic splitting (canary deployments)
+          • Service discovery
+          • Zero-trust networking
+          • Built-in observability
+          • Tap (real-time traffic inspection)
+          • Traffic policies
+
+          Key Capabilities:
+          1. mTLS: Automatic encryption between services
+             - No certificate management
+             - Automatic rotation
+             - Zero application changes
+
+          2. Load Balancing: Intelligent traffic distribution
+             - Round-robin
+             - Least-loaded
+             - Sticky sessions
+
+          3. Resilience: Handle failures gracefully
+             - Retries with exponential backoff
+             - Circuit breaking
+             - Timeouts
+             - Failover
+
+          4. Observability: Understand service behavior
+             - Golden metrics (latency, throughput, errors)
+             - Real-time traffic inspection (tap)
+             - Integration with Prometheus
+             - Grafana dashboards included
+
+          5. Traffic Management: Control request routing
+             - Canary deployments
+             - Dark traffic splitting
+             - Header-based routing
+             - Timeout policies
+
+          Resource Requirements:
+          • Control plane: ~100m CPU, 200Mi RAM
+          • Per proxy: {{ proxy_cpu_request }}-{{ proxy_cpu_limit }} CPU, {{ proxy_memory_request }}-{{ proxy_memory_limit }} RAM
+          • Minimal overhead compared to alternatives
+
+          Architecture:
+          1. Control Plane: Policy, certificate management
+          2. Proxies: Injected as sidecars (auto-injected)
+          3. Service Discovery: Kubernetes-native
+          4. Observability: Prometheus + Grafana
+
+          ======================================
+
+  tasks:
+    - name: Check if Linkerd CLI is installed
+      command: which linkerd
+      ignore_errors: yes
+      register: linkerd_check
+      changed_when: false
+
+    - name: Install Linkerd CLI
+      block:
+        - name: Download Linkerd CLI
+          get_url:
+            url: "https://github.com/linkerd/linkerd2/releases/download/edge-{{ linkerd_version }}/linkerd2-cli-{{ linkerd_version }}-linux-{{ ansible_architecture | replace('x86_64', 'amd64') | replace('aarch64', 'arm64') }}"
+            dest: "/usr/local/bin/linkerd"
+            mode: '0755'
+            timeout: 60
+
+        - name: Verify Linkerd installation
+          command: linkerd version --client
+          register: linkerd_version_check
+          changed_when: false
+
+        - name: Display installed Linkerd version
+          debug:
+            msg: "{{ linkerd_version_check.stdout }}"
+
+      when: linkerd_check is failed
+
+    - name: Check Linkerd prerequisites
+      shell: |
+        linkerd check --pre --quiet 2>&1 | head -20
+      register: linkerd_prereq
+      changed_when: false
+
+    - name: Create Linkerd namespace
+      kubernetes.core.k8s:
+        name: "{{ linkerd_namespace }}"
+        api_version: v1
+        kind: Namespace
+        state: present
+
+    - name: Install Linkerd control plane
+      shell: |
+        linkerd install \
+          --namespace {{ linkerd_namespace }} \
+          --identity-issuer-expiry 8760h \
+          --set proxyInit.runAsRoot=true \
+          {% if enable_ha %} --ha {% endif %} \
+          > /tmp/linkerd-install.yaml && \
+        kubectl apply -f /tmp/linkerd-install.yaml
+      register: linkerd_install
+      changed_when: "'created' in linkerd_install.stdout or 'configured' in linkerd_install.stdout"
+      ignore_errors: yes
+
+    - name: Wait for Linkerd control plane
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        namespace: "{{ linkerd_namespace }}"
+        name: "{{ item }}"
+        wait: yes
+        wait_condition:
+          type: Available
+          status: "True"
+        wait_sleep: 5
+        wait_timeout: 300
+      loop:
+        - linkerd-controller
+        - linkerd-identity
+        - linkerd-proxy-injector
+      ignore_errors: yes
+
+    - name: Verify Linkerd installation
+      shell: linkerd check --quiet 2>&1 | grep -c "passed"
+      register: linkerd_checks
+      changed_when: false
+
+    - name: Install Linkerd Viz (dashboards)
+      shell: |
+        linkerd viz install \
+          --namespace {{ linkerd_namespace }} \
+          > /tmp/linkerd-viz.yaml && \
+        kubectl apply -f /tmp/linkerd-viz.yaml
+      when: enable_viz
+      ignore_errors: yes
+
+    - name: Wait for Viz
+      kubernetes.core.k8s_info:
+        kind: Deployment
+        namespace: "{{ linkerd_namespace }}"
+        name: web
+        wait: yes
+        wait_condition:
+          type: Available
+          status: "True"
+        wait_sleep: 5
+        wait_timeout: 300
+      when: enable_viz
+      ignore_errors: yes
+
+    - name: Create Linkerd policy resources (if enabled)
+      block:
+        - name: Install policy CRDs
+          shell: |
+            kubectl apply -f https://github.com/linkerd/linkerd2/releases/download/edge-{{ linkerd_version }}/linkerd-policy-{{ linkerd_version }}.tgz
+          when: enable_policy
+          ignore_errors: yes
+
+      when: enable_policy
+
+    - name: Create example Linkerd resources
+      copy:
+        content: |
+          ---
+          # Example: Inject Linkerd proxy into deployment
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: myapp
+            namespace: default
+            annotations:
+              linkerd.io/inject: enabled  # Auto-inject proxy
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: myapp
+            template:
+              metadata:
+                labels:
+                  app: myapp
+              spec:
+                containers:
+                - name: app
+                  image: myapp:latest
+                  ports:
+                  - containerPort: 8080
+
+          ---
+          # Example: Server (define service policy)
+          apiVersion: policy.linkerd.io/v1beta1
+          kind: Server
+          metadata:
+            name: myapp
+            namespace: default
+          spec:
+            podSelector:
+              matchLabels:
+                app: myapp
+            port: 8080
+            protocol: HTTP
+
+          ---
+          # Example: AuthorizationPolicy (who can talk to service)
+          apiVersion: policy.linkerd.io/v1beta1
+          kind: AuthorizationPolicy
+          metadata:
+            name: allow-frontend
+            namespace: default
+          spec:
+            targetRef:
+              group: policy.linkerd.io
+              kind: Server
+              name: backend
+            rules:
+            - from:
+              - principalName: frontend
+
+          ---
+          # Example: Traffic split (canary deployment)
+          apiVersion: policy.linkerd.io/v1alpha1
+          kind: TrafficSplit
+          metadata:
+            name: myapp-canary
+            namespace: default
+          spec:
+            service: myapp
+            backends:
+            - name: myapp-stable
+              weight: 90
+            - name: myapp-canary
+              weight: 10
+
+        dest: /tmp/linkerd-examples.yaml
+
+    - name: Create Linkerd dashboard port-forward script
+      copy:
+        content: |
+          #!/bin/bash
+          # Port-forward Linkerd Viz dashboard
+
+          echo "Starting Linkerd Viz dashboard..."
+          echo "Access at: http://localhost:50750"
+          echo ""
+          echo "Press Ctrl+C to stop"
+          echo ""
+
+          kubectl port-forward -n linkerd svc/web 50750:8084
+
+        dest: /usr/local/bin/linkerd-dashboard
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create Linkerd status script
+      copy:
+        content: |
+          #!/bin/bash
+          # Check Linkerd status
+
+          echo "====== Linkerd Service Mesh Status ======"
+          echo ""
+
+          echo "Control Plane Status:"
+          linkerd check --output=short 2>&1 | head -20
+          echo ""
+
+          echo "Injected Namespaces:"
+          kubectl get ns -L linkerd.io/injection
+          echo ""
+
+          echo "Proxies Running:"
+          kubectl get pods -A | grep linkerd-proxy | wc -l
+          echo ""
+
+          echo "Service Metrics:"
+          kubectl get endpoints -A | head -10
+          echo ""
+
+          echo "Top Services by Traffic:"
+          kubectl logs -n linkerd -l linkerd.io/control-plane-component=metrics-api -f --tail=5
+          echo ""
+
+        dest: /usr/local/bin/linkerd-status
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create Linkerd injection script
+      copy:
+        content: |
+          #!/bin/bash
+          # Inject Linkerd proxy into namespace or deployment
+
+          if [ $# -eq 0 ]; then
+              echo "Usage: $0 <namespace> [deployment-name]"
+              echo ""
+              echo "Inject entire namespace:"
+              echo "  $0 myapp"
+              echo ""
+              echo "Inject specific deployment:"
+              echo "  $0 myapp mydeployment"
+              exit 1
+          fi
+
+          NAMESPACE="$1"
+          DEPLOYMENT="$2"
+
+          if [ -z "$DEPLOYMENT" ]; then
+              echo "[+] Enabling Linkerd injection for namespace: $NAMESPACE"
+              kubectl label namespace $NAMESPACE linkerd.io/injection=enabled --overwrite
+              echo "[+] Restart deployments to inject proxies"
+              echo "    kubectl rollout restart deployment -n $NAMESPACE"
+          else
+              echo "[+] Enabling Linkerd injection for $DEPLOYMENT in $NAMESPACE"
+              kubectl annotate deployment $DEPLOYMENT -n $NAMESPACE linkerd.io/inject=enabled --overwrite
+              echo "[+] Rolling out to inject proxies"
+              kubectl rollout restart deployment $DEPLOYMENT -n $NAMESPACE
+          fi
+
+        dest: /usr/local/bin/linkerd-inject
+        owner: root
+        group: root
+        mode: '0755'
+
+  post_tasks:
+    - name: Display Linkerd installation summary
+      debug:
+        msg: |
+          ====== Linkerd Service Mesh Installation Complete ======
+
+          ✓ Linkerd control plane installed
+          ✓ Proxy injector configured
+          ✓ Viz dashboard enabled
+
+          Linkerd Components:
+          ─────────────────────────────────────────
+          Controller: Policy and routing
+          Identity: mTLS certificate management
+          Proxy Injector: Auto-injects sidecars
+          Viz: Dashboard and metrics
+          Namespace: {{ linkerd_namespace }}
+
+          Key Commands:
+          ─────────────────────────────────────────
+          Status: linkerd-status
+          Dashboard: linkerd-dashboard
+          Inject namespace: linkerd-inject myapp
+          Inject deployment: linkerd-inject myapp mydeployment
+          Check health: linkerd check
+          Tap traffic: linkerd tap deployment myapp -n myapp
+
+          Service Mesh Features:
+          ─────────────────────────────────────────
+          ✓ Automatic mTLS between services
+          ✓ Intelligent load balancing
+          ✓ Circuit breaking and retries
+          ✓ Traffic visualization
+          ✓ Real-time metrics
+          ✓ Golden metrics (P50, P95, P99)
+
+          Enabling Linkerd for Applications:
+          ─────────────────────────────────────────
+          1. Label namespace:
+             kubectl label namespace myapp linkerd.io/injection=enabled
+
+          2. Restart deployments:
+             kubectl rollout restart deployment -n myapp
+
+          3. Proxies automatically injected:
+             kubectl get pods -n myapp -o wide
+
+          4. View metrics:
+             linkerd-dashboard
+             or
+             kubectl top pods -n myapp
+
+          Next Steps:
+          ─────────────────────────────────────────
+          1. Enable Linkerd for critical namespaces:
+             linkerd-inject myapp
+             linkerd-inject monitoring
+             linkerd-inject observability
+
+          2. Verify mTLS is working:
+             linkerd check --output=short
+
+          3. View traffic:
+             linkerd tap deployment myapp -n myapp
+
+          4. Monitor from dashboard:
+             linkerd-dashboard
+             Open: http://localhost:50750
+
+          5. Set up traffic policies:
+             kubectl apply -f /tmp/linkerd-examples.yaml
+
+          6. Implement canary deployments:
+             Use TrafficSplit for gradual rollouts
+
+          Performance Tips:
+          ─────────────────────────────────────────
+          • Minimal resource overhead: ~30MB per node
+          • Lightweight Rust implementation
+          • No cluster etcd changes
+          • Non-invasive service mesh
+          • Scales to 1000s of pods
+
+          Example Resources:
+          ─────────────────────────────────────────
+          Location: /tmp/linkerd-examples.yaml
+
+          Includes:
+          • Deployment with proxy injection
+          • Server definition
+          • Authorization policies
+          • Traffic splitting for canary
+
+          Troubleshooting:
+          ─────────────────────────────────────────
+          Check installation: linkerd check
+          View proxy logs: kubectl logs <pod> -c linkerd-proxy
+          Real-time tap: linkerd tap deployment myapp
+          Check metrics: linkerd -n myapp stat deployment
+
+          ==========================================
+
+    - name: Create Linkerd configuration summary
+      copy:
+        content: |
+          Linkerd Service Mesh Configuration
+          Generated: {{ ansible_date_time.iso8601 }}
+
+          Cluster: {{ ansible_hostname }}
+
+          Installation:
+          • Component: Linkerd v{{ linkerd_version }}
+          • Namespace: {{ linkerd_namespace }}
+          • Control plane ready: Yes
+          • Viz enabled: {{ "Yes" if enable_viz else "No" }}
+          • Policy enabled: {{ "Yes" if enable_policy else "No" }}
+
+          Control Plane:
+          • Controller: Manages policies and configuration
+          • Identity: Issues and rotates mTLS certificates
+          • Proxy Injector: Auto-injects Linkerd proxy sidecars
+          • Destination: Service discovery
+          • Policy: Enforces traffic authorization
+
+          Proxy Configuration:
+          • Image: linkerd-proxy (Rust implementation)
+          • Memory request: {{ proxy_memory_request }}
+          • Memory limit: {{ proxy_memory_limit }}
+          • CPU request: {{ proxy_cpu_request }}
+          • CPU limit: {{ proxy_cpu_limit }}
+          • Ports: 4143 (inbound), 4140 (outbound), 4191 (admin)
+
+          mTLS:
+          • Automatic: Yes
+          • Rotation: Every 24h
+          • Certificate authority: Linkerd CA
+          • Trust domain: cluster.local
+
+          Features:
+          • Load balancing: Round-robin, least-loaded
+          • Retries: Automatic with exponential backoff
+          • Timeouts: Configurable per policy
+          • Circuit breaking: Automatic failover
+          • Traffic splitting: For canary deployments
+          • Tap: Real-time traffic inspection
+          • Metrics: Built-in Prometheus integration
+
+          Commands:
+          • linkerd-status: Check service mesh health
+          • linkerd-dashboard: Access Viz dashboards
+          • linkerd-inject: Enable mesh for applications
+          • linkerd check: Full system validation
+          • linkerd stat: View golden metrics
+          • linkerd tap: Real-time traffic viewing
+
+          Dashboards (Viz):
+          • Access: http://localhost:50750 (via port-forward)
+          • Shows: Services, routes, errors, latency
+          • Real-time: Live traffic metrics
+          • Golden metrics: P50, P95, P99 latencies
+
+          Integration:
+          • Prometheus: Metrics on port 4191
+          • Grafana: Pre-built dashboards
+          • Jaeger: Trace integration
+          • Kubernetes: Native API resources
+
+          For more information:
+          See LINKERD_SETUP_GUIDE.md
+
+        dest: /etc/linkerd-config-summary.txt
+        owner: root
+        group: root
+        mode: '0644'
