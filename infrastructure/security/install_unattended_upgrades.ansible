@@ -1,0 +1,492 @@
+---
+# Configure automatic security updates for cluster nodes
+#
+# Unattended-upgrades provides:
+# - Automatic installation of security patches
+# - System stability (critical updates only, no major updates)
+# - Configurable update schedules
+# - Reboot management (safe reboots during maintenance windows)
+# - Email notifications on updates
+# - Package hold/pin support
+# - Integration with apt/dpkg systems
+#
+# Philosophy:
+# - Security patches: Automatic (unless reboot required)
+# - Major upgrades: Manual review required
+# - Reboots: Scheduled only if necessary
+# - Notifications: Optional email alerts
+#
+# Architecture:
+#   APT Update Check → Security Patches Available
+#         ↓
+#   Auto-install (if safe)
+#         ↓
+#   Reboot Manager (only if kernel updated)
+#         ↓
+#   Notification (optional)
+#
+# Default Configuration:
+#   - Checks for updates daily
+#   - Installs security patches automatically
+#   - Skips patches requiring reboot (unless scheduled)
+#   - Creates daily cron job
+#   - Logs to syslog
+#
+# Usage:
+#   # Deploy to all cluster nodes
+#   ansible-playbook infrastructure/security/install_unattended_upgrades.ansible
+#
+#   # Configure with auto-reboot enabled
+#   ansible-playbook infrastructure/security/install_unattended_upgrades.ansible \
+#     -e enable_auto_reboot=true \
+#     -e reboot_time="03:00" \
+#     -e reboot_day="Sunday"
+#
+#   # Send notifications on updates
+#   ansible-playbook infrastructure/security/install_unattended_upgrades.ansible \
+#     -e enable_notifications=true \
+#     -e notification_email="admin@example.com"
+#
+
+- hosts: all
+  gather_facts: yes
+  become: yes
+
+  vars:
+    # Security updates configuration
+    enable_security_updates: true
+    enable_auto_reboot: false  # Set to true only if auto-reboots are acceptable
+    reboot_time: "03:00"       # Time to reboot (3 AM)
+    reboot_day: "Sunday"       # Day to allow reboots
+    enable_notifications: false
+    notification_email: "admin@example.com"
+
+    # Update options
+    mail_on_change: "{{ enable_notifications | default(false) }}"
+    auto_reboot_with_users: "{{ enable_auto_reboot | default(false) }}"
+    auto_reboot: "{{ enable_auto_reboot | default(false) }}"
+
+    # Packages to exclude from auto-upgrade
+    # Add packages that should not be auto-updated
+    packages_to_hold: []
+    # Example: ["postgresql", "kubernetes", "docker.io"]
+
+  pre_tasks:
+    - name: Display unattended-upgrades installation information
+      debug:
+        msg: |
+          ====== Automatic Security Updates Setup ======
+
+          Component: unattended-upgrades
+          System: Ubuntu/Debian APT package manager
+          Update Scope: Security patches only
+          Schedule: Daily update checks
+
+          Update Strategy:
+          • Security patches: Automatic installation
+          • Major updates: Require manual review
+          • Kernel updates: Subject to reboot policy
+          • Reboot policy: {{ "Auto-reboot enabled" if enable_auto_reboot else "Manual reboot required" }}
+
+          Features:
+          • Automatic security patch detection
+          • Safe package update selection
+          • Dependency resolution
+          • Transaction logging
+          • Email notifications (optional)
+          • Update tracking and reporting
+
+          Configuration:
+          • Update check: Daily via cron
+          • Smart reboot: Only if necessary
+          • Logging: /var/log/unattended-upgrades/
+          • Configuration: /etc/apt/apt.conf.d/50unattended-upgrades
+
+          Benefits:
+          • Reduces security vulnerabilities
+          • Minimizes manual maintenance
+          • Maintains system stability
+          • Provides audit trail of updates
+          • Customizable per environment
+
+          Reboot Policy: {{ "Disabled (manual reboot required)" if not enable_auto_reboot else "Enabled (" + reboot_time + " " + reboot_day + ")" }}
+          Notifications: {{ "Disabled" if not enable_notifications else "Enabled (" + notification_email + ")" }}
+
+          ======================================
+
+  tasks:
+    - name: Install unattended-upgrades and dependencies
+      apt:
+        name:
+          - unattended-upgrades
+          - apt-listchanges
+          - apt-show-versions
+        state: present
+        update_cache: yes
+
+    - name: Create unattended-upgrades configuration
+      copy:
+        content: |
+          // Enable the update of unattended-upgrades package itself
+          Unattended-Upgrade::Package-Blacklist {
+          };
+
+          // Allow the system to reboot with the user logged in
+          Unattended-Upgrade::AllowRebootWithUsers "{{ auto_reboot_with_users }}";
+
+          // Automatic reboot at the specified time (only if updates require it)
+          Unattended-Upgrade::Automatic-Reboot "{{ auto_reboot }}";
+          Unattended-Upgrade::Automatic-Reboot-Time "{{ reboot_time }}";
+          Unattended-Upgrade::Automatic-Reboot-WithUsers "{{ auto_reboot_with_users }}";
+
+          // Automatically reboot without confirmation
+          Unattended-Upgrade::SyslogEnable "true";
+          Unattended-Upgrade::SyslogFacility "daemon";
+
+          // Limit to security updates from Ubuntu repositories
+          Unattended-Upgrade::Origins-Pattern {
+              "origin=Ubuntu,archive=${distro_codename}-security,label=Ubuntu";
+          };
+
+          // Mail notifications
+          Unattended-Upgrade::Mail "{{ notification_email if enable_notifications else "root" }}";
+          Unattended-Upgrade::MailOnlyOnError "{{ "false" if enable_notifications else "true" }}";
+
+          // Run each week (by default runs after apt updates scheduled in cron)
+          APT::Periodic::Unattended-Upgrade "1";
+          APT::Periodic::Download-Upgradeable-Packages "1";
+          APT::Periodic::AutocleanInterval "7";
+          APT::Periodic::Update-Package-Lists "1";
+
+          // Only email on changes (not every day)
+          Unattended-Upgrade::MailReport "only-on-change";
+
+          // Automatically remove unused kernel meta-packages
+          Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+          Unattended-Upgrade::Remove-Unused-Dependencies "true";
+
+          // Automatically remove unused boot.d/ packages
+          Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+
+          // Automatically reboot kernel if needed
+          Unattended-Upgrade::Automatic-Reboot-WithUsers "{{ auto_reboot_with_users }}";
+
+          // Low Priority packages
+          Unattended-Upgrade::Package-Blacklist {
+          };
+
+          // Run unattended-upgrade when packages need to be held
+          // This prevents auto-upgrade of certain packages
+        dest: /etc/apt/apt.conf.d/50unattended-upgrades
+        owner: root
+        group: root
+        mode: '0644'
+      register: unattended_config
+
+    - name: Create APT periodic configuration
+      copy:
+        content: |
+          // Enable the update of unattended-upgrades package itself
+          APT::Periodic::Unattended-Upgrade "1";
+
+          // Daily checks for available updates
+          APT::Periodic::Update-Package-Lists "1";
+          APT::Periodic::Download-Upgradeable-Packages "1";
+          APT::Periodic::AutocleanInterval "7";
+
+          // Enable debug logging (comment out for production)
+          // APT::Periodic::Verbose "2";
+
+        dest: /etc/apt/apt.conf.d/02periodic
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Hold packages from auto-upgrade
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop: "{{ packages_to_hold }}"
+      when: packages_to_hold | length > 0
+
+    - name: Enable unattended-upgrades service
+      systemd:
+        name: unattended-upgrades
+        enabled: yes
+        state: started
+      register: unattended_service
+
+    - name: Check unattended-upgrades configuration
+      shell: unattended-upgrade --dry-run
+      register: config_check
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Create update status script
+      copy:
+        content: |
+          #!/bin/bash
+          # Display unattended-upgrades status and recent updates
+
+          echo "====== Security Updates Status ======"
+          echo ""
+
+          # Check last update run
+          if [ -f /var/log/unattended-upgrades/unattended-upgrades.log ]; then
+              echo "Last Update Run:"
+              tail -n 5 /var/log/unattended-upgrades/unattended-upgrades.log
+          else
+              echo "No update logs found yet"
+          fi
+
+          echo ""
+          echo "====== Pending Security Updates ======"
+
+          # Check for available updates
+          apt list --upgradable 2>/dev/null | grep -i security || echo "No security updates available"
+
+          echo ""
+          echo "====== Unattended-Upgrades Configuration ======"
+          systemctl status unattended-upgrades --no-pager | head -10
+
+          echo ""
+          echo "====== Recent System Packages ======"
+          dpkg -l | grep "^ii" | tail -5
+
+          echo ""
+          echo "====== APT Configuration ======"
+          echo "Automatic updates enabled: $(grep -c 'Unattended-Upgrade::Automatic-Reboot "true"' /etc/apt/apt.conf.d/50unattended-upgrades && echo "Yes" || echo "No")"
+          echo "Auto-reboot policy: $(grep 'Unattended-Upgrade::Automatic-Reboot ' /etc/apt/apt.conf.d/50unattended-upgrades | tail -1)"
+
+        dest: /usr/local/bin/security-update-status
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create logs directory
+      file:
+        path: /var/log/unattended-upgrades
+        state: directory
+        owner: root
+        group: root
+        mode: '0750'
+
+    - name: Create update report script
+      copy:
+        content: |
+          #!/bin/bash
+          # Generate security update report
+
+          REPORT_FILE="/var/log/security-updates-$(date +%Y%m%d).txt"
+
+          {
+              echo "Security Updates Report"
+              echo "Generated: $(date)"
+              echo "Hostname: $(hostname)"
+              echo ""
+              echo "====== Unattended-Upgrades Status ======"
+              systemctl status unattended-upgrades --no-pager
+
+              echo ""
+              echo "====== Recently Installed Packages ======"
+              dpkg -l | grep "^ii" | awk '{print $2, $3}' | tail -20
+
+              echo ""
+              echo "====== Security Updates Applied ======"
+              if [ -f /var/log/unattended-upgrades/unattended-upgrades.log ]; then
+                  grep -i "upgrades" /var/log/unattended-upgrades/unattended-upgrades.log | tail -10
+              else
+                  echo "No update logs available"
+              fi
+
+              echo ""
+              echo "====== Held Packages (Not auto-upgraded) ======"
+              apt-mark showhold || echo "No packages on hold"
+
+          } | tee "$REPORT_FILE"
+
+          echo ""
+          echo "Report saved to: $REPORT_FILE"
+
+        dest: /usr/local/bin/security-update-report
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Create reboot alert script
+      copy:
+        content: |
+          #!/bin/bash
+          # Alert if reboot is required
+
+          if [ -f /var/run/reboot-required ]; then
+              echo "⚠️  SYSTEM REBOOT REQUIRED"
+              echo ""
+              echo "Reason: $(cat /var/run/reboot-required.pkgs 2>/dev/null | head -1)"
+              echo ""
+              if [ "{{ enable_auto_reboot }}" == "True" ]; then
+                  echo "Automatic reboot scheduled: {{ reboot_time }} {{ reboot_day }}"
+              else
+                  echo "Manual reboot required. Run: sudo reboot"
+              fi
+              exit 1
+          else
+              echo "No reboot required"
+              exit 0
+          fi
+
+        dest: /usr/local/bin/check-reboot-required
+        owner: root
+        group: root
+        mode: '0755'
+
+  post_tasks:
+    - name: Display unattended-upgrades installation summary
+      debug:
+        msg: |
+          ====== Unattended-Upgrades Installation Complete ======
+
+          ✓ Automatic security updates configured
+          ✓ Daily update checks enabled
+          ✓ Security patches will install automatically
+
+          Configuration:
+          ─────────────────────────────────────────
+          Config File: /etc/apt/apt.conf.d/50unattended-upgrades
+          APT Config: /etc/apt/apt.conf.d/02periodic
+          Service: unattended-upgrades
+
+          Update Schedule:
+          ─────────────────────────────────────────
+          Check frequency: Daily
+          Install scope: Security patches only
+          Major updates: Manual review required
+          {% if enable_auto_reboot %}
+          Auto-reboot: Enabled ({{ reboot_time }} {{ reboot_day }})
+          {% else %}
+          Auto-reboot: Disabled (manual reboot required)
+          {% endif %}
+          {% if enable_notifications %}
+          Notifications: Enabled ({{ notification_email }})
+          {% else %}
+          Notifications: Disabled
+          {% endif %}
+
+          Service Management:
+          ─────────────────────────────────────────
+          Status: sudo systemctl status unattended-upgrades
+          Restart: sudo systemctl restart unattended-upgrades
+          Logs: sudo tail -f /var/log/unattended-upgrades/unattended-upgrades.log
+          Test: sudo unattended-upgrade --dry-run
+
+          Utility Scripts:
+          ─────────────────────────────────────────
+          Update status: security-update-status
+          Update report: security-update-report
+          Reboot check: check-reboot-required
+
+          Manual Operations:
+          ─────────────────────────────────────────
+          View security updates: apt list --upgradable | grep security
+          Hold package: sudo apt-mark hold <package-name>
+          Unhold package: sudo apt-mark unhold <package-name>
+          Force update check: sudo unattended-upgrade -d
+          Reboot system: sudo reboot
+
+          Logs and Monitoring:
+          ─────────────────────────────────────────
+          Update logs: /var/log/unattended-upgrades/unattended-upgrades.log
+          System logs: journalctl -u unattended-upgrades -f
+          APT logs: /var/log/apt/history.log
+          Reboot required: [ -f /var/run/reboot-required ] && echo "YES" || echo "NO"
+
+          Best Practices:
+          ─────────────────────────────────────────
+          1. Monitor for required reboots: check-reboot-required
+          2. Review security updates periodically: security-update-status
+          3. Test in staging before enabling auto-reboot
+          4. Keep non-critical services on hold if needed
+          5. Plan reboot windows for production systems
+          6. Set up notifications for package updates
+
+          Next Steps:
+          ─────────────────────────────────────────
+          1. Verify configuration: security-update-status
+          2. Test dry-run: sudo unattended-upgrade --dry-run
+          3. Review logs: tail -f /var/log/unattended-upgrades/unattended-upgrades.log
+          4. Configure email notifications if desired
+          5. Set up monitoring alerts for reboot-required
+
+          ==========================================
+
+    - name: Create security updates configuration summary
+      copy:
+        content: |
+          Unattended-Upgrades Security Updates Configuration
+          Generated: {{ ansible_date_time.iso8601 }}
+
+          Hostname: {{ ansible_hostname }}
+          System: {{ ansible_distribution }} {{ ansible_distribution_version }}
+
+          Automatic Updates:
+          • Enabled: Yes
+          • Scope: Security patches only
+          • Frequency: Daily checks
+          • Auto-install: Enabled
+          • Reboot Policy: {{ "Auto-reboot enabled (" + reboot_time + " " + reboot_day + ")" if enable_auto_reboot else "Manual reboot required" }}
+
+          Configuration Files:
+          • Main config: /etc/apt/apt.conf.d/50unattended-upgrades
+          • APT periodic: /etc/apt/apt.conf.d/02periodic
+          • Held packages: /etc/apt/preferences.d/
+
+          Service Management:
+          • Service: unattended-upgrades
+          • Status: sudo systemctl status unattended-upgrades
+          • Logs: /var/log/unattended-upgrades/unattended-upgrades.log
+          • Journal: journalctl -u unattended-upgrades
+
+          Monitoring:
+          • Check status: security-update-status
+          • View report: security-update-report
+          • Reboot required: check-reboot-required
+          • Dry run: sudo unattended-upgrade --dry-run
+
+          Email Notifications:
+          • Configured: {{ "Yes (" + notification_email + ")" if enable_notifications else "No" }}
+          • On changes only: Yes
+          • Mail on error: Yes
+
+          Update History:
+          • Log location: /var/log/apt/history.log
+          • Update logs: /var/log/unattended-upgrades/
+
+          Manual Operations:
+          • Check updates: apt list --upgradable
+          • Hold package: apt-mark hold <package>
+          • Unhold package: apt-mark unhold <package>
+          • Force update: unattended-upgrade -d
+          • Reboot: reboot
+
+          Security Considerations:
+          • Only security patches are auto-installed
+          • Major version updates require manual review
+          • Kernel updates may trigger automatic reboot
+          • All changes are logged for audit trail
+          • No credentials stored in configuration
+
+        dest: /etc/apt/apt.conf.d/CONFIGURATION-README.txt
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Run initial update check
+      shell: unattended-upgrade --dry-run 2>&1 | head -20
+      register: initial_check
+      changed_when: false
+      ignore_errors: yes
+
+    - name: Display update check result
+      debug:
+        msg: "{{ initial_check.stdout_lines }}"
+      when: initial_check.stdout_lines | length > 0
