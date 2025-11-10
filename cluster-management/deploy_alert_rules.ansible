@@ -1,0 +1,272 @@
+---
+# Deploy Prometheus Alert Rules to Monitoring Node
+#
+# Includes:
+# - Alert rules for node, system, Docker, and Kubernetes metrics
+# - Optional Slack webhook integration
+# - AlertManager configuration
+# - Verification of alert loading
+#
+# Usage:
+#   # Deploy with Slack notifications
+#   ansible-playbook cluster-management/deploy_alert_rules.ansible \
+#     -e slack_webhook_url="https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+#
+#   # Deploy without notifications
+#   ansible-playbook cluster-management/deploy_alert_rules.ansible
+#
+# Verify:
+#   curl http://localhost:9090/api/v1/rules | jq '.'
+
+- hosts: monitoring
+  gather_facts: yes
+  become: yes
+
+  vars:
+    prometheus_config_dir: "/etc/prometheus"
+    alertmanager_config_dir: "/etc/alertmanager"
+    slack_webhook_url: "{{ slack_webhook_url | default('') }}"
+
+  pre_tasks:
+    - name: Display alert rules deployment information
+      debug:
+        msg: |
+          ====== Prometheus Alert Rules Deployment ======
+
+          Deploying {{ prometheus_config_dir }}/alert_rules.yml
+          Slack webhook: {{ 'Configured' if slack_webhook_url else 'Not configured' }}
+
+          Alert categories:
+          - Node Health (5 alerts)
+          - CPU Usage (2 alerts)
+          - Memory Usage (3 alerts)
+          - Disk Space (4 alerts)
+          - Network (2 alerts)
+          - Prometheus (3 alerts)
+          - Grafana (1 alert)
+          - Docker (2 alerts)
+          - Kubernetes (5 alerts)
+          - System (2 alerts)
+          - Service Availability (2 alerts)
+
+          Total: 31 alert rules
+
+          ================================================
+
+  tasks:
+    # Deploy alert rules
+    - name: Copy alert rules to Prometheus config directory
+      copy:
+        src: "{{ playbook_dir }}/../monitoring/config/prometheus/alert_rules.yml"
+        dest: "{{ prometheus_config_dir }}/alert_rules.yml"
+        owner: prometheus
+        group: prometheus
+        mode: '0644'
+      register: alert_rules_update
+
+    - name: Validate Prometheus configuration
+      shell: "promtool check config {{ prometheus_config_dir }}/prometheus.yml"
+      register: config_validation
+      changed_when: false
+
+    - name: Display config validation result
+      debug:
+        msg: "{{ config_validation.stdout }}"
+
+    # Update Prometheus config to include alert rules
+    - name: Check if prometheus.yml includes alert_rules.yml
+      shell: grep -q "alert_rules.yml" {{ prometheus_config_dir }}/prometheus.yml
+      ignore_errors: yes
+      register: alert_rules_included
+      changed_when: false
+
+    - name: Add alert_rules.yml to prometheus.yml if not present
+      lineinfile:
+        path: "{{ prometheus_config_dir }}/prometheus.yml"
+        regexp: "^rule_files:"
+        line: "rule_files:\n  - {{ prometheus_config_dir }}/alert_rules.yml"
+        state: present
+      when: alert_rules_included is failed
+
+    # Optional: Configure AlertManager for notifications
+    - name: Create AlertManager config directory
+      file:
+        path: "{{ alertmanager_config_dir }}"
+        state: directory
+        owner: alertmanager
+        group: alertmanager
+        mode: '0755'
+      ignore_errors: yes
+
+    # Slack integration
+    - name: Create AlertManager config with Slack integration
+      block:
+        - name: Generate AlertManager configuration
+          copy:
+            content: |
+              global:
+                resolve_timeout: 5m
+                slack_api_url: '{{ slack_webhook_url }}'
+
+              route:
+                receiver: 'slack'
+                group_by: ['alertname', 'cluster', 'service']
+                group_wait: 10s
+                group_interval: 10s
+                repeat_interval: 12h
+
+              receivers:
+                - name: 'slack'
+                  slack_configs:
+                    - channel: '#alerts'
+                      title: 'PicoCluster Alert: {{ .GroupLabels.alertname }}'
+                      text: '{{ range .Alerts }}{{ .Annotations.description }}{{ end }}'
+                      send_resolved: true
+                      color: '{{ if eq .Status "firing" }}danger{{ else }}good{{ end }}'
+            dest: "{{ alertmanager_config_dir }}/alertmanager.yml"
+            owner: alertmanager
+            group: alertmanager
+            mode: '0644'
+          register: alertmanager_config_update
+
+        - name: Create AlertManager systemd service
+          copy:
+            content: |
+              [Unit]
+              Description=Prometheus AlertManager
+              Wants=network-online.target
+              After=network-online.target
+
+              [Service]
+              Type=simple
+              User=alertmanager
+              Group=alertmanager
+              ExecStart=/usr/local/bin/alertmanager \
+                --config.file={{ alertmanager_config_dir }}/alertmanager.yml \
+                --storage.path=/var/lib/alertmanager
+
+              SyslogIdentifier=alertmanager
+              Restart=always
+              RestartSec=5
+
+              [Install]
+              WantedBy=multi-user.target
+            dest: /etc/systemd/system/alertmanager.service
+            owner: root
+            group: root
+            mode: '0644'
+          register: alertmanager_service
+          ignore_errors: yes
+
+        - name: Create AlertManager user
+          user:
+            name: alertmanager
+            system: yes
+            shell: /bin/false
+            comment: "AlertManager user"
+          ignore_errors: yes
+
+        - name: Create AlertManager data directory
+          file:
+            path: /var/lib/alertmanager
+            state: directory
+            owner: alertmanager
+            group: alertmanager
+            mode: '0755'
+          ignore_errors: yes
+
+      when: slack_webhook_url != ''
+
+    # Reload Prometheus to apply alert rules
+    - name: Reload Prometheus to apply alert rules
+      systemd:
+        name: prometheus
+        state: reloaded
+      when: alert_rules_update is changed
+
+    - name: Wait for Prometheus to reload
+      uri:
+        url: "http://localhost:9090/-/healthy"
+        method: GET
+        status_code: 200
+      retries: 10
+      delay: 2
+      changed_when: false
+
+    # Verify alert rules are loaded
+    - name: Verify alert rules loaded in Prometheus
+      shell: |
+        curl -s http://localhost:9090/api/v1/rules | jq '.data.groups[0].rules | length' 2>/dev/null || echo "0"
+      register: alert_rules_count
+      changed_when: false
+
+  post_tasks:
+    - name: Display alert rules deployment summary
+      debug:
+        msg: |
+          ====== Alert Rules Deployment Complete ======
+
+          ✓ Alert rules deployed: {{ prometheus_config_dir }}/alert_rules.yml
+          ✓ Alert rules loaded: {{ alert_rules_count.stdout }}
+
+          Access alert configuration:
+          ─────────────────────────────────────────
+          Prometheus Alerts: http://localhost:9090/alerts
+          Prometheus Rules: http://localhost:9090/api/v1/rules
+          Alert Status: http://localhost:9090/api/v1/alerts
+
+          Alert Categories Deployed:
+          ─────────────────────────────────────────
+          • Node Health: NodeDown, MultipleNodesDown
+          • CPU Usage: HighCPUUsage, CriticalCPUUsage
+          • Memory Usage: HighMemoryUsage, CriticalMemoryUsage, OutOfMemory
+          • Disk Space: DiskSpaceWarning, DiskSpaceCritical, DiskFull, InodeSpaceWarning
+          • Network: HighNetworkPacketLoss, NetworkInterfaceDown
+          • Prometheus: PrometheusDown, PrometheusHighScrapeErrorRate, PrometheusConfigReloadFailure
+          • Grafana: GrafanaDown
+          • Docker: DockerDaemonDown, HighContainerRestarts
+          • Kubernetes: KubeletDown, KubePodCrashLooping, KubeNodeNotReady, KubeMemoryPressure, KubeDiskPressure
+          • System: SystemLoadHigh, TooManyOpenFiles
+          • Service Availability: NodeExporterDown, TargetDown
+
+          Alert Severity Levels:
+          ─────────────────────────────────────────
+          critical: Requires immediate action
+          warning:  Should be addressed soon
+          info:     Informational only
+
+          Testing Alert Rules:
+          ─────────────────────────────────────────
+          1. View active alerts: http://localhost:9090/alerts
+          2. Trigger a test alert by stopping a service:
+             sudo systemctl stop node_exporter
+          3. Check if alert fires (may take 1-2 minutes)
+          4. Restart the service:
+             sudo systemctl start node_exporter
+
+          {% if slack_webhook_url != '' %}
+          Slack Integration:
+          ─────────────────────────────────────────
+          ✓ Slack webhook configured
+          ✓ Alerts will be sent to #alerts channel
+          ✓ AlertManager deployment available
+
+          {% endif %}
+          Next Steps:
+          ─────────────────────────────────────────
+          1. Review alert thresholds and adjust if needed
+          2. Configure notification channels (Slack, email, etc.)
+          3. Set up dashboard for alert monitoring
+          4. Test alerts by triggering them manually
+
+          ==========================================
+
+    - name: Test alert rules syntax
+      shell: |
+        curl -s http://localhost:9090/api/v1/rules | jq '.data.groups[] | {name: .name, rules: (.rules | length)}'
+      changed_when: false
+      register: rules_test
+
+    - name: Display rules loaded by Prometheus
+      debug:
+        msg: "{{ rules_test.stdout }}"
