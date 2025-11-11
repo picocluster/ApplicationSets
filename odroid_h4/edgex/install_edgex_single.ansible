@@ -1,0 +1,536 @@
+---
+# EdgeX Foundry Single Node Installation - Odroid H4 (x86-64)
+#
+# EdgeX Foundry is an open-source, vendor-neutral IoT edge computing platform
+# for building interoperable IoT solutions. It provides microservices for:
+# - Device connectivity and protocol translation
+# - Data collection and local processing
+# - Cloud connectivity and data export
+# - Security and access control
+# - Rules engine and analytics
+#
+# This playbook installs EdgeX Foundry "Jakarta" release (LTS) using Docker Compose
+#
+# Requirements:
+# - Ubuntu Server 20.04+ or Debian 11+
+# - Minimum 4GB RAM (8GB recommended)
+# - 20GB+ available disk space
+# - Docker and Docker Compose installed
+#
+# Usage:
+#   ansible-playbook -i inventory.ini install_edgex_single.ansible
+#
+# Architecture:
+# - Core Services: Core Data, Core Metadata, Core Command
+# - Support Services: Notifications, Scheduler, Rules Engine
+# - Application Services: App Service Configurable
+# - Device Services: Virtual Device (for testing)
+# - Security Services: Secret Store, API Gateway
+#
+# Ports:
+# - 8500: Consul UI
+# - 8080: EdgeX UI (if enabled)
+# - 59880: Core Data API
+# - 59881: Core Metadata API
+# - 59882: Core Command API
+# - 59860: Rules Engine API
+#
+# Author: PicoCluster Team
+# Platform: Odroid H4 (Intel x86-64)
+# License: MIT
+
+- name: Install EdgeX Foundry on Odroid H4
+  hosts: all
+  become: yes
+  vars:
+    edgex_version: "jakarta"
+    edgex_release: "3.1"
+    edgex_dir: "/opt/edgex"
+    edgex_data_dir: "/var/lib/edgex"
+    edgex_user: "edgex"
+    edgex_compose_file: "docker-compose-jakarta.yml"
+
+  tasks:
+    - name: Update package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - curl
+          - wget
+          - git
+          - jq
+          - net-tools
+        state: present
+
+    - name: Check if Docker is installed
+      command: docker --version
+      register: docker_check
+      ignore_errors: yes
+
+    - name: Fail if Docker is not installed
+      fail:
+        msg: |
+          Docker is not installed. Please install Docker first:
+          ansible-playbook -i inventory.ini docker/install_docker.ansible
+      when: docker_check.rc != 0
+
+    - name: Check if Docker Compose is installed
+      command: docker compose version
+      register: compose_check
+      ignore_errors: yes
+
+    - name: Install Docker Compose plugin if missing
+      apt:
+        name: docker-compose-plugin
+        state: present
+      when: compose_check.rc != 0
+
+    - name: Create EdgeX user
+      user:
+        name: "{{ edgex_user }}"
+        system: yes
+        shell: /bin/bash
+        home: "{{ edgex_dir }}"
+        create_home: no
+
+    - name: Add EdgeX user to docker group
+      user:
+        name: "{{ edgex_user }}"
+        groups: docker
+        append: yes
+
+    - name: Create EdgeX directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "{{ edgex_user }}"
+        group: "{{ edgex_user }}"
+        mode: '0755'
+      loop:
+        - "{{ edgex_dir }}"
+        - "{{ edgex_dir }}/compose"
+        - "{{ edgex_dir }}/config"
+        - "{{ edgex_data_dir }}"
+        - "{{ edgex_data_dir }}/consul"
+        - "{{ edgex_data_dir }}/db"
+
+    - name: Download EdgeX compose files
+      get_url:
+        url: "https://raw.githubusercontent.com/edgexfoundry/edgex-compose/{{ edgex_version }}/{{ item }}"
+        dest: "{{ edgex_dir }}/compose/{{ item }}"
+        owner: "{{ edgex_user }}"
+        group: "{{ edgex_user }}"
+        mode: '0644'
+      loop:
+        - docker-compose.yml
+        - docker-compose-no-secty.yml
+
+    - name: Create EdgeX environment file
+      copy:
+        dest: "{{ edgex_dir }}/compose/.env"
+        owner: "{{ edgex_user }}"
+        group: "{{ edgex_user }}"
+        mode: '0644'
+        content: |
+          # EdgeX Foundry Environment Configuration
+          EDGEX_VERSION={{ edgex_release }}
+
+          # Network Configuration
+          EDGEX_HOST={{ ansible_default_ipv4.address }}
+
+          # Security (set to false for development, true for production)
+          EDGEX_SECURITY_ENABLED=false
+
+          # Data Retention (hours)
+          EDGEX_DATA_RETENTION=168
+
+          # Logging
+          EDGEX_LOG_LEVEL=INFO
+
+          # Consul
+          EDGEX_CONSUL_HOST=edgex-core-consul
+
+          # Database (Redis)
+          EDGEX_DATABASE=redis
+          EDGEX_REDIS_HOST=edgex-redis
+
+          # Message Bus (Redis)
+          EDGEX_MESSAGEQUEUE_HOST=edgex-redis
+
+          # Registry
+          EDGEX_REGISTRY_HOST=edgex-core-consul
+
+    - name: Create custom docker-compose override for simplified stack
+      copy:
+        dest: "{{ edgex_dir }}/compose/docker-compose.override.yml"
+        owner: "{{ edgex_user }}"
+        group: "{{ edgex_user }}"
+        mode: '0644'
+        content: |
+          # EdgeX Foundry Custom Configuration
+          version: '3.7'
+
+          services:
+            # Consul - Service registry and configuration
+            consul:
+              container_name: edgex-core-consul
+              image: consul:1.16
+              ports:
+                - "8500:8500"
+              volumes:
+                - consul-data:/consul/data
+              networks:
+                - edgex-network
+              restart: unless-stopped
+              environment:
+                - CONSUL_LOCAL_CONFIG={"skip_leave_on_interrupt":true}
+              command: agent -server -ui -bootstrap-expect=1 -client=0.0.0.0
+
+            # Redis - Database and message bus
+            redis:
+              container_name: edgex-redis
+              image: redis:7-alpine
+              ports:
+                - "6379:6379"
+              volumes:
+                - redis-data:/data
+              networks:
+                - edgex-network
+              restart: unless-stopped
+
+            # Core Data - Data persistence service
+            core-data:
+              container_name: edgex-core-data
+              image: edgexfoundry/core-data:{{ edgex_release }}
+              ports:
+                - "59880:59880"
+              networks:
+                - edgex-network
+              environment:
+                EDGEX_SECURITY_SECRET_STORE: "false"
+                REGISTRY_HOST: consul
+                CLIENTS_CORE_COMMAND_HOST: core-command
+                DATABASE_HOST: redis
+                MESSAGEQUEUE_HOST: redis
+              depends_on:
+                - consul
+                - redis
+              restart: unless-stopped
+
+            # Core Metadata - Device and service metadata
+            core-metadata:
+              container_name: edgex-core-metadata
+              image: edgexfoundry/core-metadata:{{ edgex_release }}
+              ports:
+                - "59881:59881"
+              networks:
+                - edgex-network
+              environment:
+                EDGEX_SECURITY_SECRET_STORE: "false"
+                REGISTRY_HOST: consul
+                DATABASE_HOST: redis
+                MESSAGEQUEUE_HOST: redis
+              depends_on:
+                - consul
+                - redis
+              restart: unless-stopped
+
+            # Core Command - Command and control service
+            core-command:
+              container_name: edgex-core-command
+              image: edgexfoundry/core-command:{{ edgex_release }}
+              ports:
+                - "59882:59882"
+              networks:
+                - edgex-network
+              environment:
+                EDGEX_SECURITY_SECRET_STORE: "false"
+                REGISTRY_HOST: consul
+                DATABASE_HOST: redis
+                MESSAGEQUEUE_HOST: redis
+              depends_on:
+                - consul
+                - redis
+                - core-metadata
+              restart: unless-stopped
+
+            # Support Notifications - Alerting and notifications
+            support-notifications:
+              container_name: edgex-support-notifications
+              image: edgexfoundry/support-notifications:{{ edgex_release }}
+              ports:
+                - "59860:59860"
+              networks:
+                - edgex-network
+              environment:
+                EDGEX_SECURITY_SECRET_STORE: "false"
+                REGISTRY_HOST: consul
+                DATABASE_HOST: redis
+                MESSAGEQUEUE_HOST: redis
+              depends_on:
+                - consul
+                - redis
+              restart: unless-stopped
+
+            # Support Scheduler - Job scheduling
+            support-scheduler:
+              container_name: edgex-support-scheduler
+              image: edgexfoundry/support-scheduler:{{ edgex_release }}
+              ports:
+                - "59861:59861"
+              networks:
+                - edgex-network
+              environment:
+                EDGEX_SECURITY_SECRET_STORE: "false"
+                REGISTRY_HOST: consul
+                DATABASE_HOST: redis
+                MESSAGEQUEUE_HOST: redis
+              depends_on:
+                - consul
+                - redis
+              restart: unless-stopped
+
+            # App Service Rules - Rules engine
+            app-service-rules:
+              container_name: edgex-app-rules-engine
+              image: edgexfoundry/app-service-configurable:{{ edgex_release }}
+              ports:
+                - "59701:59701"
+              networks:
+                - edgex-network
+              environment:
+                EDGEX_SECURITY_SECRET_STORE: "false"
+                EDGEX_PROFILE: rules-engine
+                REGISTRY_HOST: consul
+                DATABASE_HOST: redis
+                MESSAGEQUEUE_HOST: redis
+                TRIGGER_EDGEXMESSAGEBUS_SUBSCRIBEHOST_HOST: redis
+              depends_on:
+                - consul
+                - redis
+                - core-data
+              restart: unless-stopped
+
+            # Device Virtual - Virtual device for testing
+            device-virtual:
+              container_name: edgex-device-virtual
+              image: edgexfoundry/device-virtual:{{ edgex_release }}
+              ports:
+                - "59900:59900"
+              networks:
+                - edgex-network
+              environment:
+                EDGEX_SECURITY_SECRET_STORE: "false"
+                REGISTRY_HOST: consul
+                CLIENTS_CORE_COMMAND_HOST: core-command
+                CLIENTS_CORE_METADATA_HOST: core-metadata
+                CLIENTS_CORE_DATA_HOST: core-data
+                MESSAGEQUEUE_HOST: redis
+              depends_on:
+                - consul
+                - redis
+                - core-data
+                - core-metadata
+                - core-command
+              restart: unless-stopped
+
+          networks:
+            edgex-network:
+              driver: bridge
+
+          volumes:
+            consul-data:
+            redis-data:
+
+    - name: Create systemd service for EdgeX
+      copy:
+        dest: /etc/systemd/system/edgex.service
+        mode: '0644'
+        content: |
+          [Unit]
+          Description=EdgeX Foundry IoT Edge Platform
+          Requires=docker.service
+          After=docker.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          WorkingDirectory={{ edgex_dir }}/compose
+          User={{ edgex_user }}
+          Group={{ edgex_user }}
+
+          # Start EdgeX services
+          ExecStart=/usr/bin/docker compose -f docker-compose.override.yml up -d
+
+          # Stop EdgeX services
+          ExecStop=/usr/bin/docker compose -f docker-compose.override.yml down
+
+          # Restart policy
+          Restart=on-failure
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable EdgeX service
+      systemd:
+        name: edgex
+        enabled: yes
+
+    - name: Start EdgeX Foundry
+      systemd:
+        name: edgex
+        state: started
+
+    - name: Wait for EdgeX services to be ready
+      wait_for:
+        port: "{{ item }}"
+        delay: 5
+        timeout: 120
+      loop:
+        - 8500  # Consul
+        - 59880 # Core Data
+        - 59881 # Core Metadata
+        - 59882 # Core Command
+
+    - name: Check EdgeX services status
+      uri:
+        url: "http://localhost:{{ item.port }}/api/{{ item.version }}/ping"
+        method: GET
+        status_code: 200
+      register: edgex_health
+      retries: 5
+      delay: 5
+      loop:
+        - { port: 59880, version: v3 }  # Core Data
+        - { port: 59881, version: v3 }  # Core Metadata
+        - { port: 59882, version: v3 }  # Core Command
+      ignore_errors: yes
+
+    - name: Create EdgeX CLI helper script
+      copy:
+        dest: "{{ edgex_dir }}/edgex-cli.sh"
+        owner: "{{ edgex_user }}"
+        group: "{{ edgex_user }}"
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # EdgeX Foundry CLI Helper Script
+
+          EDGEX_HOST="localhost"
+          CORE_DATA_PORT="59880"
+          CORE_METADATA_PORT="59881"
+          CORE_COMMAND_PORT="59882"
+
+          case "$1" in
+            status)
+              echo "=== EdgeX Services Status ==="
+              docker compose -f {{ edgex_dir }}/compose/docker-compose.override.yml ps
+              ;;
+
+            logs)
+              if [ -z "$2" ]; then
+                docker compose -f {{ edgex_dir }}/compose/docker-compose.override.yml logs -f
+              else
+                docker compose -f {{ edgex_dir }}/compose/docker-compose.override.yml logs -f "$2"
+              fi
+              ;;
+
+            restart)
+              echo "Restarting EdgeX services..."
+              docker compose -f {{ edgex_dir }}/compose/docker-compose.override.yml restart
+              ;;
+
+            devices)
+              echo "=== Registered Devices ==="
+              curl -s http://${EDGEX_HOST}:${CORE_METADATA_PORT}/api/v3/device | jq '.devices[] | {name: .name, serviceName: .serviceName, adminState: .adminState}'
+              ;;
+
+            readings)
+              echo "=== Recent Readings (last 10) ==="
+              curl -s "http://${EDGEX_HOST}:${CORE_DATA_PORT}/api/v3/reading?limit=10" | jq '.readings[] | {deviceName: .deviceName, resourceName: .resourceName, value: .value, timestamp: .origin}'
+              ;;
+
+            events)
+              echo "=== Recent Events (last 10) ==="
+              curl -s "http://${EDGEX_HOST}:${CORE_DATA_PORT}/api/v3/event?limit=10" | jq '.events[] | {deviceName: .deviceName, timestamp: .origin, readingCount: (.readings | length)}'
+              ;;
+
+            commands)
+              if [ -z "$2" ]; then
+                echo "Usage: $0 commands <device-name>"
+                exit 1
+              fi
+              echo "=== Available Commands for $2 ==="
+              curl -s "http://${EDGEX_HOST}:${CORE_COMMAND_PORT}/api/v3/device/name/$2" | jq
+              ;;
+
+            ui)
+              echo "Opening EdgeX UIs..."
+              echo "Consul UI: http://${EDGEX_HOST}:8500"
+              echo "Core Data API: http://${EDGEX_HOST}:${CORE_DATA_PORT}"
+              echo "Core Metadata API: http://${EDGEX_HOST}:${CORE_METADATA_PORT}"
+              echo "Core Command API: http://${EDGEX_HOST}:${CORE_COMMAND_PORT}"
+              ;;
+
+            *)
+              echo "EdgeX Foundry CLI Helper"
+              echo ""
+              echo "Usage: $0 {status|logs|restart|devices|readings|events|commands|ui}"
+              echo ""
+              echo "Commands:"
+              echo "  status              - Show status of all EdgeX services"
+              echo "  logs [service]      - Show logs (all or specific service)"
+              echo "  restart             - Restart all EdgeX services"
+              echo "  devices             - List registered devices"
+              echo "  readings            - Show recent sensor readings"
+              echo "  events              - Show recent events"
+              echo "  commands <device>   - Show available commands for device"
+              echo "  ui                  - Show URLs for web interfaces"
+              exit 1
+              ;;
+          esac
+
+    - name: Display installation summary
+      debug:
+        msg:
+          - "============================================"
+          - "EdgeX Foundry Installation Complete!"
+          - "============================================"
+          - ""
+          - "EdgeX Version: {{ edgex_release }} ({{ edgex_version }})"
+          - "Installation Directory: {{ edgex_dir }}"
+          - ""
+          - "Services:"
+          - "  - Consul UI: http://{{ ansible_default_ipv4.address }}:8500"
+          - "  - Core Data API: http://{{ ansible_default_ipv4.address }}:59880"
+          - "  - Core Metadata API: http://{{ ansible_default_ipv4.address }}:59881"
+          - "  - Core Command API: http://{{ ansible_default_ipv4.address }}:59882"
+          - ""
+          - "Management:"
+          - "  Start:   sudo systemctl start edgex"
+          - "  Stop:    sudo systemctl stop edgex"
+          - "  Status:  sudo systemctl status edgex"
+          - "  Logs:    {{ edgex_dir }}/edgex-cli.sh logs"
+          - ""
+          - "CLI Helper:"
+          - "  {{ edgex_dir }}/edgex-cli.sh status"
+          - "  {{ edgex_dir }}/edgex-cli.sh devices"
+          - "  {{ edgex_dir }}/edgex-cli.sh readings"
+          - ""
+          - "Next Steps:"
+          - "  1. Access Consul UI to view service registry"
+          - "  2. Check device-virtual service for test data"
+          - "  3. Use REST APIs to interact with EdgeX"
+          - "  4. Configure device services for your IoT devices"
+          - ""
+          - "Documentation: https://docs.edgexfoundry.org"
+          - "============================================"
