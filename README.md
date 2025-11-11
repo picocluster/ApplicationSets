@@ -12,8 +12,8 @@ ApplicationSets provides complete infrastructure-as-code for the PicoCluster pro
 - **Load Balancing**: Traefik for modern reverse proxy and load balancing
 - **Container Registry**: Harbor for private image management with vulnerability scanning
 - **System Containers**: LXD for lightweight containerization
-- **IoT Platform**: EdgeX Foundry for edge computing and IoT data management
-- **Virtualization**: KVM/QEMU (x86-64 only), Proxmox VE (x86-64 only)
+- **IoT Platform**: EdgeX Foundry for edge computing and IoT device management ✨
+- **Virtualization**: KVM/QEMU (x86-64 only), Proxmox VE (x86-64 only) ✨
 
 ## 🖥️ Supported Hardware
 
@@ -61,7 +61,8 @@ ApplicationSets/
 │   │   ├── install_kubernetes_containerd_single.ansible
 │   │   ├── install_kubernetes_containerd_cluster.ansible
 │   │   ├── install_k3s_single.ansible
-│   │   └── install_k3s_cluster.ansible
+│   │   ├── install_k3s_cluster.ansible
+│   │   └── install_microk8s.ansible
 │   ├── docker/                            # Docker and Docker Swarm
 │   │   ├── install_docker.ansible
 │   │   └── setup_docker_swarm.ansible
@@ -81,6 +82,10 @@ ApplicationSets/
 │   │   └── install_harbor_single.ansible
 │   ├── traefik/                           # Load balancer
 │   │   └── install_traefik_single.ansible
+│   ├── edgex/                             # IoT edge platform ✨
+│   │   └── install_edgex_single.ansible
+│   ├── proxmox/                           # Virtualization (x86-64 only) ✨
+│   │   └── install_proxmox_single.ansible
 │   └── QUICK_REFERENCE.md
 │
 ├── rpi5/                                  # Raspberry Pi 5 (ARM64) automation
@@ -91,7 +96,8 @@ ApplicationSets/
 │   │   ├── install_kubernetes_containerd_single_*.ansible
 │   │   ├── install_kubernetes_containerd_cluster_*.ansible
 │   │   ├── install_k3s_single_*.ansible
-│   │   └── install_k3s_cluster_*.ansible
+│   │   ├── install_k3s_cluster_*.ansible
+│   │   └── microk8s-ansible/
 │   ├── docker/                            # Ubuntu and Raspbian variants
 │   │   ├── install_docker_*.ansible
 │   │   └── setup_docker_swarm_*.ansible
@@ -107,6 +113,9 @@ ApplicationSets/
 │   ├── ceph/                              # Ubuntu and Raspbian variants
 │   │   ├── install_ceph_single_*.ansible
 │   │   └── setup_ceph_cluster_*.ansible
+│   ├── edgex/                             # IoT edge platform ✨
+│   │   ├── install_edgex_single_ubuntu.ansible
+│   │   └── install_edgex_single_raspbian.ansible
 │   └── README_RPI5_KUBERNETES.md
 │
 ├── odroid_c5/                             # Odroid C5 (ARM64) automation
@@ -133,6 +142,8 @@ ApplicationSets/
 │   ├── ceph/
 │   │   ├── install_ceph_single.ansible
 │   │   └── setup_ceph_cluster.ansible
+│   ├── edgex/                             # IoT edge platform ✨
+│   │   └── install_edgex_single.ansible
 │   └── README_ODROID_C5_KUBERNETES.md
 │
 └── DOCKER_SWARM_GUIDE.md                  # Docker Swarm specific documentation
