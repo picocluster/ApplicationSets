@@ -1,0 +1,331 @@
+---
+# Proxmox VE Installation - Odroid H4 (x86-64 Only)
+#
+# Proxmox Virtual Environment is an open-source virtualization management platform
+# that combines KVM hypervisor and LXC containers with a powerful web-based management interface.
+#
+# **IMPORTANT**: Proxmox VE is x86-64 ONLY - NOT available for ARM64 platforms (RPI5, Odroid C5)
+#
+# Features:
+# - KVM-based full virtualization
+# - LXC container support
+# - Web-based management interface
+# - RESTful API
+# - High Availability (HA) clustering
+# - Software-defined storage (ZFS, Ceph, etc.)
+# - Backup and restore
+# - Live migration
+#
+# This playbook installs Proxmox VE on top of an existing Debian 12 (Bookworm) or
+# Ubuntu 22.04 system. For production use, a fresh Proxmox VE ISO installation is recommended.
+#
+# Requirements:
+# - Odroid H4 or compatible x86-64 hardware
+# - Debian 12 (Bookworm) or Ubuntu 22.04 LTS
+# - Minimum 4GB RAM (8GB+ recommended)
+# - 32GB+ storage (100GB+ recommended)
+# - CPU with virtualization support (Intel VT-x or AMD-V)
+# - Static IP address configured
+# - FQDN hostname configured (e.g., pve.local.lan)
+#
+# Ports:
+# - 8006: Proxmox web interface (HTTPS)
+# - 3128: SPICE proxy (optional)
+# - 5900-5999: VNC/noVNC
+# - 111: NFS/RPC
+# - 22: SSH
+#
+# Usage:
+#   ansible-playbook -i inventory.ini install_proxmox_single.ansible
+#
+# Post-Installation:
+#   Access web interface at https://<hostname>:8006
+#   Default login: root (with your system root password)
+#
+# Author: PicoCluster Team
+# Platform: Odroid H4 (Intel x86-64) - x86-64 ONLY!
+# License: MIT
+#
+# WARNING: This will convert your system to a Proxmox VE host. Ensure you have backups!
+
+- name: Install Proxmox VE on Odroid H4
+  hosts: all
+  become: yes
+  vars:
+    proxmox_version: "8.1"
+    proxmox_repo: "pve-no-subscription"  # or "pve-enterprise" with subscription
+
+  pre_tasks:
+    - name: Check if running on x86-64 architecture
+      fail:
+        msg: |
+          ERROR: Proxmox VE requires x86-64 architecture!
+          Current architecture: {{ ansible_architecture }}
+
+          Proxmox VE is NOT available for ARM64 platforms (Raspberry Pi 5, Odroid C5).
+          This playbook can only run on Odroid H4 or other x86-64 systems.
+      when: ansible_architecture != "x86_64"
+
+    - name: Gather system facts
+      setup:
+
+    - name: Check virtualization support
+      shell: |
+        if grep -E 'vmx|svm' /proc/cpuinfo > /dev/null; then
+          echo "Virtualization supported"
+        else
+          echo "Virtualization NOT supported"
+          exit 1
+        fi
+      register: virt_check
+      failed_when: virt_check.rc != 0
+
+    - name: Check if hostname is FQDN
+      assert:
+        that:
+          - ansible_fqdn is defined
+          - ansible_fqdn != ansible_hostname
+          - "'.' in ansible_fqdn"
+        fail_msg: |
+          Hostname must be a Fully Qualified Domain Name (FQDN).
+          Current hostname: {{ ansible_hostname }}
+          Current FQDN: {{ ansible_fqdn | default('not set') }}
+
+          Please configure FQDN first:
+          sudo hostnamectl set-hostname pve.local.lan
+          echo "127.0.1.1 pve.local.lan pve" >> /etc/hosts
+        success_msg: "FQDN properly configured: {{ ansible_fqdn }}"
+
+  tasks:
+    - name: Update package cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install prerequisite packages
+      apt:
+        name:
+          - gnupg
+          - ca-certificates
+          - curl
+          - wget
+          - apt-transport-https
+          - software-properties-common
+        state: present
+
+    - name: Remove conflicting packages
+      apt:
+        name:
+          - os-prober
+        state: absent
+      ignore_errors: yes
+
+    - name: Add Proxmox VE GPG key
+      apt_key:
+        url: https://enterprise.proxmox.com/debian/proxmox-release-bookworm.gpg
+        state: present
+        keyring: /etc/apt/trusted.gpg.d/proxmox-release-bookworm.gpg
+
+    - name: Add Proxmox VE repository
+      apt_repository:
+        repo: "deb [arch=amd64] http://download.proxmox.com/debian/pve bookworm {{ proxmox_repo }}"
+        state: present
+        filename: proxmox
+
+    - name: Update package cache after adding Proxmox repo
+      apt:
+        update_cache: yes
+
+    - name: Install Proxmox VE kernel and packages
+      apt:
+        name:
+          - proxmox-ve
+          - postfix
+          - open-iscsi
+        state: present
+      register: proxmox_install
+
+    - name: Remove old Debian/Ubuntu kernel (optional, keep if uncertain)
+      apt:
+        name:
+          - linux-image-generic
+          - linux-image-amd64
+        state: absent
+      when: false  # Set to true to remove old kernels
+      ignore_errors: yes
+
+    - name: Update GRUB
+      command: update-grub
+      when: proxmox_install.changed
+
+    - name: Configure Postfix for local delivery
+      debconf:
+        name: postfix
+        question: "postfix/main_mailer_type"
+        value: "Local only"
+        vtype: "string"
+
+    - name: Enable and start Proxmox services
+      systemd:
+        name: "{{ item }}"
+        enabled: yes
+        state: started
+      loop:
+        - pve-cluster
+        - pvedaemon
+        - pveproxy
+        - pvestatd
+        - pve-firewall
+      ignore_errors: yes
+
+    - name: Check if Proxmox web interface is accessible
+      wait_for:
+        port: 8006
+        delay: 5
+        timeout: 60
+      ignore_errors: yes
+
+    - name: Create Proxmox CLI helper script
+      copy:
+        dest: /usr/local/bin/pve-cli
+        mode: '0755'
+        content: |
+          #!/bin/bash
+          # Proxmox VE CLI Helper Script
+
+          case "$1" in
+            status)
+              echo "=== Proxmox VE Status ==="
+              systemctl status pveproxy pvedaemon pve-cluster | grep Active
+              ;;
+
+            version)
+              pveversion -v
+              ;;
+
+            nodes)
+              pvecm nodes 2>/dev/null || echo "Single node (not in cluster)"
+              ;;
+
+            vms)
+              echo "=== Virtual Machines ==="
+              qm list
+              ;;
+
+            containers)
+              echo "=== LXC Containers ==="
+              pct list
+              ;;
+
+            storage)
+              echo "=== Storage Overview ==="
+              pvesm status
+              ;;
+
+            backup)
+              echo "=== Recent Backups ==="
+              ls -lh /var/lib/vz/dump/ 2>/dev/null || echo "No backups found"
+              ;;
+
+            logs)
+              echo "=== Recent Proxmox Logs ==="
+              journalctl -u pveproxy -u pvedaemon --since "1 hour ago" --no-pager | tail -50
+              ;;
+
+            web)
+              IP=$(hostname -I | awk '{print $1}')
+              echo "Proxmox Web Interface: https://${IP}:8006"
+              echo "Login with root and your system password"
+              ;;
+
+            *)
+              echo "Proxmox VE CLI Helper"
+              echo ""
+              echo "Usage: $0 {status|version|nodes|vms|containers|storage|backup|logs|web}"
+              echo ""
+              echo "Commands:"
+              echo "  status      - Show Proxmox services status"
+              echo "  version     - Show Proxmox version information"
+              echo "  nodes       - List cluster nodes"
+              echo "  vms         - List virtual machines"
+              echo "  containers  - List LXC containers"
+              echo "  storage     - Show storage status"
+              echo "  backup      - List recent backups"
+              echo "  logs        - Show recent logs"
+              echo "  web         - Show web interface URL"
+              echo ""
+              echo "Native Proxmox commands:"
+              echo "  qm          - Manage VMs"
+              echo "  pct         - Manage containers"
+              echo "  pvesm       - Manage storage"
+              echo "  pvecm       - Manage cluster"
+              echo "  pveum       - Manage users/permissions"
+              exit 1
+              ;;
+          esac
+
+    - name: Display installation summary
+      debug:
+        msg:
+          - "============================================"
+          - "Proxmox VE Installation Complete!"
+          - "============================================"
+          - ""
+          - "**IMPORTANT**: Reboot required to load Proxmox kernel!"
+          - ""
+          - "Proxmox Version: {{ proxmox_version }}"
+          - "Hostname: {{ ansible_fqdn }}"
+          - "IP Address: {{ ansible_default_ipv4.address }}"
+          - ""
+          - "Web Interface:"
+          - "  URL: https://{{ ansible_default_ipv4.address }}:8006"
+          - "  Login: root"
+          - "  Password: <your root password>"
+          - ""
+          - "After reboot, you can:"
+          - "  1. Access web interface at https://{{ ansible_default_ipv4.address }}:8006"
+          - "  2. Create VMs and containers"
+          - "  3. Configure storage"
+          - "  4. Set up networking"
+          - "  5. Join to cluster (optional)"
+          - ""
+          - "CLI Helper:"
+          - "  pve-cli status      - Check services"
+          - "  pve-cli vms         - List VMs"
+          - "  pve-cli containers  - List containers"
+          - "  pve-cli web         - Show web URL"
+          - ""
+          - "Common Commands:"
+          - "  qm list             - List VMs"
+          - "  qm create           - Create VM"
+          - "  pct list            - List containers"
+          - "  pvesm status        - Storage status"
+          - ""
+          - "Documentation: https://pve.proxmox.com/wiki"
+          - ""
+          - "**NEXT STEP**: sudo reboot"
+          - "============================================"
+
+    - name: Create reboot reminder file
+      copy:
+        dest: /etc/motd
+        content: |
+          ╔════════════════════════════════════════════════════════════════╗
+          ║                   PROXMOX VE INSTALLED                         ║
+          ║                                                                ║
+          ║  Proxmox VE has been installed successfully!                   ║
+          ║                                                                ║
+          ║  Web Interface: https://{{ ansible_default_ipv4.address }}:8006                      ║
+          ║  Login: root (with your system password)                       ║
+          ║                                                                ║
+          ║  The system was rebooted to load the Proxmox kernel.           ║
+          ║                                                                ║
+          ║  Quick Commands:                                               ║
+          ║    pve-cli status    - Check Proxmox status                    ║
+          ║    qm list           - List virtual machines                   ║
+          ║    pct list          - List containers                         ║
+          ║    pve-cli web       - Show web interface URL                  ║
+          ║                                                                ║
+          ║  Documentation: https://pve.proxmox.com/wiki                   ║
+          ╚════════════════════════════════════════════════════════════════╝
+
