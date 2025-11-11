@@ -1,0 +1,397 @@
+{
+  "dashboard": {
+    "title": "Proxmox VE Monitoring",
+    "tags": ["proxmox", "virtualization", "kvm", "lxc"],
+    "timezone": "browser",
+    "schemaVersion": 16,
+    "version": 0,
+    "refresh": "30s",
+    "panels": [
+      {
+        "id": 1,
+        "gridPos": {"x": 0, "y": 0, "w": 4, "h": 4},
+        "type": "stat",
+        "title": "Host Status",
+        "targets": [
+          {
+            "expr": "pve_up",
+            "legendFormat": "PVE Host"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 1, "color": "green"}
+              ]
+            },
+            "mappings": [
+              {"type": "value", "value": "0", "text": "Down"},
+              {"type": "value", "value": "1", "text": "Up"}
+            ],
+            "unit": "short"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "gridPos": {"x": 4, "y": 0, "w": 4, "h": 4},
+        "type": "stat",
+        "title": "Running VMs",
+        "targets": [
+          {
+            "expr": "count(pve_guest_info{type=\"qemu\",status=\"running\"})",
+            "legendFormat": "VMs"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "blue"}
+              ]
+            },
+            "unit": "short"
+          }
+        }
+      },
+      {
+        "id": 3,
+        "gridPos": {"x": 8, "y": 0, "w": 4, "h": 4},
+        "type": "stat",
+        "title": "Running Containers",
+        "targets": [
+          {
+            "expr": "count(pve_guest_info{type=\"lxc\",status=\"running\"})",
+            "legendFormat": "Containers"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "blue"}
+              ]
+            },
+            "unit": "short"
+          }
+        }
+      },
+      {
+        "id": 4,
+        "gridPos": {"x": 12, "y": 0, "w": 4, "h": 4},
+        "type": "stat",
+        "title": "CPU Usage",
+        "targets": [
+          {
+            "expr": "100 - (avg by (instance) (irate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)",
+            "legendFormat": "CPU %"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 70, "color": "yellow"},
+                {"value": 90, "color": "red"}
+              ]
+            },
+            "unit": "percent"
+          }
+        }
+      },
+      {
+        "id": 5,
+        "gridPos": {"x": 16, "y": 0, "w": 4, "h": 4},
+        "type": "stat",
+        "title": "Memory Usage",
+        "targets": [
+          {
+            "expr": "(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100",
+            "legendFormat": "Memory %"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 80, "color": "yellow"},
+                {"value": 95, "color": "red"}
+              ]
+            },
+            "unit": "percent"
+          }
+        }
+      },
+      {
+        "id": 6,
+        "gridPos": {"x": 20, "y": 0, "w": 4, "h": 4},
+        "type": "stat",
+        "title": "Storage Usage",
+        "targets": [
+          {
+            "expr": "(1 - (node_filesystem_avail_bytes{mountpoint=\"/\"} / node_filesystem_size_bytes{mountpoint=\"/\"})) * 100",
+            "legendFormat": "Storage %"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 80, "color": "yellow"},
+                {"value": 95, "color": "red"}
+              ]
+            },
+            "unit": "percent"
+          }
+        }
+      },
+      {
+        "id": 7,
+        "gridPos": {"x": 0, "y": 4, "w": 12, "h": 8},
+        "type": "graph",
+        "title": "Host CPU Usage",
+        "targets": [
+          {
+            "expr": "100 - (avg by (instance) (irate(node_cpu_seconds_total{mode=\"idle\"}[5m])) * 100)",
+            "legendFormat": "CPU Usage %"
+          },
+          {
+            "expr": "avg by (instance) (irate(node_cpu_seconds_total{mode=\"system\"}[5m])) * 100",
+            "legendFormat": "System %"
+          },
+          {
+            "expr": "avg by (instance) (irate(node_cpu_seconds_total{mode=\"user\"}[5m])) * 100",
+            "legendFormat": "User %"
+          }
+        ],
+        "yaxes": [
+          {"format": "percent", "label": "CPU %", "max": 100, "min": 0},
+          {"format": "short"}
+        ],
+        "legend": {"show": true},
+        "tooltip": {"shared": true}
+      },
+      {
+        "id": 8,
+        "gridPos": {"x": 12, "y": 4, "w": 12, "h": 8},
+        "type": "graph",
+        "title": "Host Memory Usage",
+        "targets": [
+          {
+            "expr": "node_memory_MemTotal_bytes",
+            "legendFormat": "Total"
+          },
+          {
+            "expr": "node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes",
+            "legendFormat": "Used"
+          },
+          {
+            "expr": "node_memory_MemAvailable_bytes",
+            "legendFormat": "Available"
+          }
+        ],
+        "yaxes": [
+          {"format": "bytes", "label": "Memory"},
+          {"format": "short"}
+        ],
+        "legend": {"show": true},
+        "tooltip": {"shared": true}
+      },
+      {
+        "id": 9,
+        "gridPos": {"x": 0, "y": 12, "w": 12, "h": 8},
+        "type": "graph",
+        "title": "VM CPU Usage",
+        "targets": [
+          {
+            "expr": "pve_guest_cpu_usage{type=\"qemu\"}",
+            "legendFormat": "{{ name }}"
+          }
+        ],
+        "yaxes": [
+          {"format": "percent", "label": "CPU %"},
+          {"format": "short"}
+        ],
+        "legend": {"show": true, "alignAsTable": true, "rightSide": false},
+        "tooltip": {"shared": true}
+      },
+      {
+        "id": 10,
+        "gridPos": {"x": 12, "y": 12, "w": 12, "h": 8},
+        "type": "graph",
+        "title": "VM Memory Usage",
+        "targets": [
+          {
+            "expr": "pve_guest_mem_usage{type=\"qemu\"}",
+            "legendFormat": "{{ name }}"
+          }
+        ],
+        "yaxes": [
+          {"format": "bytes", "label": "Memory"},
+          {"format": "short"}
+        ],
+        "legend": {"show": true, "alignAsTable": true, "rightSide": false},
+        "tooltip": {"shared": true}
+      },
+      {
+        "id": 11,
+        "gridPos": {"x": 0, "y": 20, "w": 12, "h": 8},
+        "type": "graph",
+        "title": "Network Traffic",
+        "targets": [
+          {
+            "expr": "rate(node_network_receive_bytes_total[5m])",
+            "legendFormat": "{{ device }} RX"
+          },
+          {
+            "expr": "rate(node_network_transmit_bytes_total[5m])",
+            "legendFormat": "{{ device }} TX"
+          }
+        ],
+        "yaxes": [
+          {"format": "Bps", "label": "Network"},
+          {"format": "short"}
+        ],
+        "legend": {"show": true},
+        "tooltip": {"shared": true}
+      },
+      {
+        "id": 12,
+        "gridPos": {"x": 12, "y": 20, "w": 12, "h": 8},
+        "type": "graph",
+        "title": "Disk I/O",
+        "targets": [
+          {
+            "expr": "rate(node_disk_read_bytes_total[5m])",
+            "legendFormat": "{{ device }} Read"
+          },
+          {
+            "expr": "rate(node_disk_written_bytes_total[5m])",
+            "legendFormat": "{{ device }} Write"
+          }
+        ],
+        "yaxes": [
+          {"format": "Bps", "label": "Disk I/O"},
+          {"format": "short"}
+        ],
+        "legend": {"show": true},
+        "tooltip": {"shared": true}
+      },
+      {
+        "id": 13,
+        "gridPos": {"x": 0, "y": 28, "w": 24, "h": 8},
+        "type": "table",
+        "title": "Virtual Machines / Containers Status",
+        "targets": [
+          {
+            "expr": "pve_guest_info",
+            "format": "table",
+            "instant": true
+          }
+        ],
+        "transformations": [
+          {
+            "id": "organize",
+            "options": {
+              "excludeByName": {},
+              "indexByName": {},
+              "renameByName": {
+                "name": "Name",
+                "type": "Type",
+                "status": "Status",
+                "vmid": "VM ID",
+                "node": "Node",
+                "cpus": "CPUs",
+                "maxmem": "Max Memory"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": 14,
+        "gridPos": {"x": 0, "y": 36, "w": 12, "h": 8},
+        "type": "graph",
+        "title": "Storage Pool Usage",
+        "targets": [
+          {
+            "expr": "pve_storage_size_bytes",
+            "legendFormat": "{{ storage }} Total"
+          },
+          {
+            "expr": "pve_storage_used_bytes",
+            "legendFormat": "{{ storage }} Used"
+          }
+        ],
+        "yaxes": [
+          {"format": "bytes", "label": "Storage"},
+          {"format": "short"}
+        ],
+        "legend": {"show": true},
+        "tooltip": {"shared": true}
+      },
+      {
+        "id": 15,
+        "gridPos": {"x": 12, "y": 36, "w": 12, "h": 8},
+        "type": "graph",
+        "title": "Container Resource Usage",
+        "targets": [
+          {
+            "expr": "pve_guest_cpu_usage{type=\"lxc\"}",
+            "legendFormat": "{{ name }} CPU"
+          },
+          {
+            "expr": "pve_guest_mem_usage{type=\"lxc\"} / pve_guest_maxmem{type=\"lxc\"} * 100",
+            "legendFormat": "{{ name }} Memory %"
+          }
+        ],
+        "yaxes": [
+          {"format": "percent", "label": "%"},
+          {"format": "short"}
+        ],
+        "legend": {"show": true, "alignAsTable": true},
+        "tooltip": {"shared": true}
+      }
+    ],
+    "templating": {
+      "list": [
+        {
+          "name": "datasource",
+          "type": "datasource",
+          "query": "prometheus",
+          "current": {"text": "Prometheus", "value": "Prometheus"}
+        },
+        {
+          "name": "node",
+          "type": "query",
+          "datasource": "Prometheus",
+          "query": "label_values(pve_up, instance)",
+          "refresh": 1,
+          "includeAll": false,
+          "multi": false
+        }
+      ]
+    },
+    "time": {"from": "now-6h", "to": "now"},
+    "timepicker": {
+      "refresh_intervals": ["10s", "30s", "1m", "5m", "15m", "30m", "1h", "2h", "1d"]
+    }
+  }
+}

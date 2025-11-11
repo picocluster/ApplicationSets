@@ -1,0 +1,307 @@
+{
+  "dashboard": {
+    "title": "EdgeX Foundry Monitoring",
+    "tags": ["edgex", "iot", "edge-computing"],
+    "timezone": "browser",
+    "schemaVersion": 16,
+    "version": 0,
+    "refresh": "10s",
+    "panels": [
+      {
+        "id": 1,
+        "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
+        "type": "stat",
+        "title": "Total Events (24h)",
+        "targets": [
+          {
+            "expr": "increase(edgex_core_data_events_total[24h])",
+            "legendFormat": "Events"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 10000, "color": "yellow"},
+                {"value": 50000, "color": "red"}
+              ]
+            },
+            "unit": "short"
+          }
+        }
+      },
+      {
+        "id": 2,
+        "gridPos": {"x": 6, "y": 0, "w": 6, "h": 4},
+        "type": "stat",
+        "title": "Events Per Second",
+        "targets": [
+          {
+            "expr": "rate(edgex_core_data_events_total[1m])",
+            "legendFormat": "Events/sec"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "green"},
+                {"value": 100, "color": "yellow"},
+                {"value": 1000, "color": "red"}
+              ]
+            },
+            "unit": "ops"
+          }
+        }
+      },
+      {
+        "id": 3,
+        "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4},
+        "type": "stat",
+        "title": "Active Devices",
+        "targets": [
+          {
+            "expr": "edgex_core_metadata_devices_total",
+            "legendFormat": "Devices"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 1, "color": "green"}
+              ]
+            },
+            "unit": "short"
+          }
+        }
+      },
+      {
+        "id": 4,
+        "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
+        "type": "stat",
+        "title": "Service Health",
+        "targets": [
+          {
+            "expr": "up{job=~\"edgex.*\"}",
+            "legendFormat": "{{ job }}"
+          }
+        ],
+        "fieldConfig": {
+          "defaults": {
+            "color": {"mode": "thresholds"},
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {"value": 0, "color": "red"},
+                {"value": 1, "color": "green"}
+              ]
+            },
+            "mappings": [
+              {"type": "value", "value": "0", "text": "Down"},
+              {"type": "value", "value": "1", "text": "Up"}
+            ],
+            "unit": "short"
+          }
+        }
+      },
+      {
+        "id": 5,
+        "gridPos": {"x": 0, "y": 4, "w": 12, "h": 8},
+        "type": "graph",
+        "title": "Event Ingestion Rate",
+        "targets": [
+          {
+            "expr": "rate(edgex_core_data_events_total[5m])",
+            "legendFormat": "Events/sec"
+          }
+        ],
+        "yaxes": [
+          {"format": "ops", "label": "Events per second"},
+          {"format": "short"}
+        ],
+        "legend": {"show": true},
+        "tooltip": {"shared": true}
+      },
+      {
+        "id": 6,
+        "gridPos": {"x": 12, "y": 4, "w": 12, "h": 8},
+        "type": "graph",
+        "title": "Reading Count by Device",
+        "targets": [
+          {
+            "expr": "rate(edgex_core_data_readings_total{device!=\"\"}[5m])",
+            "legendFormat": "{{ device }}"
+          }
+        ],
+        "yaxes": [
+          {"format": "ops", "label": "Readings per second"},
+          {"format": "short"}
+        ],
+        "legend": {"show": true, "alignAsTable": true, "rightSide": false},
+        "tooltip": {"shared": true}
+      },
+      {
+        "id": 7,
+        "gridPos": {"x": 0, "y": 12, "w": 12, "h": 8},
+        "type": "graph",
+        "title": "Service Response Time",
+        "targets": [
+          {
+            "expr": "rate(edgex_http_request_duration_seconds_sum[5m]) / rate(edgex_http_request_duration_seconds_count[5m])",
+            "legendFormat": "{{ service }} - {{ method }} {{ path }}"
+          }
+        ],
+        "yaxes": [
+          {"format": "s", "label": "Response time"},
+          {"format": "short"}
+        ],
+        "legend": {"show": true},
+        "tooltip": {"shared": true}
+      },
+      {
+        "id": 8,
+        "gridPos": {"x": 12, "y": 12, "w": 12, "h": 8},
+        "type": "graph",
+        "title": "Error Rate by Service",
+        "targets": [
+          {
+            "expr": "rate(edgex_http_requests_total{status=~\"5..\"}[5m])",
+            "legendFormat": "{{ service }} - {{ status }}"
+          }
+        ],
+        "yaxes": [
+          {"format": "ops", "label": "Errors per second"},
+          {"format": "short"}
+        ],
+        "legend": {"show": true},
+        "tooltip": {"shared": true},
+        "alert": {
+          "conditions": [
+            {
+              "evaluator": {"params": [0.1], "type": "gt"},
+              "operator": {"type": "and"},
+              "query": {"params": ["A", "5m", "now"]},
+              "reducer": {"params": [], "type": "avg"},
+              "type": "query"
+            }
+          ],
+          "executionErrorState": "alerting",
+          "frequency": "1m",
+          "handler": 1,
+          "name": "EdgeX Error Rate Alert",
+          "noDataState": "no_data",
+          "notifications": []
+        }
+      },
+      {
+        "id": 9,
+        "gridPos": {"x": 0, "y": 20, "w": 8, "h": 6},
+        "type": "graph",
+        "title": "Consul Health Checks",
+        "targets": [
+          {
+            "expr": "consul_health_service_status{service_name=~\"edgex.*\"}",
+            "legendFormat": "{{ service_name }} - {{ status }}"
+          }
+        ],
+        "yaxes": [
+          {"format": "short", "label": "Status"},
+          {"format": "short"}
+        ],
+        "legend": {"show": true},
+        "tooltip": {"shared": true}
+      },
+      {
+        "id": 10,
+        "gridPos": {"x": 8, "y": 20, "w": 8, "h": 6},
+        "type": "graph",
+        "title": "Redis Memory Usage",
+        "targets": [
+          {
+            "expr": "redis_memory_used_bytes{job=\"edgex-redis\"}",
+            "legendFormat": "Used Memory"
+          },
+          {
+            "expr": "redis_memory_max_bytes{job=\"edgex-redis\"}",
+            "legendFormat": "Max Memory"
+          }
+        ],
+        "yaxes": [
+          {"format": "bytes", "label": "Memory"},
+          {"format": "short"}
+        ],
+        "legend": {"show": true},
+        "tooltip": {"shared": true}
+      },
+      {
+        "id": 11,
+        "gridPos": {"x": 16, "y": 20, "w": 8, "h": 6},
+        "type": "table",
+        "title": "Device Status",
+        "targets": [
+          {
+            "expr": "edgex_device_status{status=\"up\"}",
+            "format": "table",
+            "instant": true
+          }
+        ],
+        "transformations": [
+          {
+            "id": "organize",
+            "options": {
+              "excludeByName": {},
+              "indexByName": {},
+              "renameByName": {
+                "device": "Device Name",
+                "service": "Device Service",
+                "admin_state": "Admin State",
+                "operating_state": "Operating State"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": 12,
+        "gridPos": {"x": 0, "y": 26, "w": 24, "h": 8},
+        "type": "graph",
+        "title": "Data Export Throughput",
+        "targets": [
+          {
+            "expr": "rate(edgex_app_service_messages_processed_total[5m])",
+            "legendFormat": "{{ app_service }} - {{ destination }}"
+          }
+        ],
+        "yaxes": [
+          {"format": "ops", "label": "Messages per second"},
+          {"format": "short"}
+        ],
+        "legend": {"show": true, "alignAsTable": true, "rightSide": false},
+        "tooltip": {"shared": true}
+      }
+    ],
+    "templating": {
+      "list": [
+        {
+          "name": "datasource",
+          "type": "datasource",
+          "query": "prometheus",
+          "current": {"text": "Prometheus", "value": "Prometheus"}
+        }
+      ]
+    },
+    "time": {"from": "now-6h", "to": "now"},
+    "timepicker": {
+      "refresh_intervals": ["5s", "10s", "30s", "1m", "5m", "15m", "30m", "1h", "2h", "1d"]
+    }
+  }
+}

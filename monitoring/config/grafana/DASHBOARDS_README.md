@@ -193,6 +193,72 @@ Comprehensive dashboard suite for complete cluster visibility and troubleshootin
 
 ---
 
+### 10. **EdgeX Foundry Monitoring** (`dashboard_edgex_monitoring.json`)
+**Purpose**: IoT edge platform monitoring and device management
+
+**Shows**:
+- Total events ingested (24h)
+- Event ingestion rate (events/second)
+- Active device count
+- Service health status
+- Event ingestion trends
+- Reading count by device
+- Service response times
+- Error rates by service
+- Consul health checks
+- Redis memory usage
+- Device status table
+- Data export throughput
+
+**Best For**: IoT edge computing, device monitoring, EdgeX operations
+
+**Key Components**:
+- Event Metrics (total, rate)
+- Device Monitoring
+- Service Performance
+- Infrastructure Health (Consul, Redis)
+- Export Analytics
+
+**Requires**:
+- EdgeX Foundry deployed
+- Prometheus metrics enabled
+- EdgeX services exposing /api/v3/metrics
+
+---
+
+### 11. **Proxmox VE Monitoring** (`dashboard_proxmox_monitoring.json`)
+**Purpose**: Virtualization platform monitoring for VMs and containers
+
+**Shows**:
+- Proxmox host status
+- Running VMs and containers count
+- Host CPU, memory, storage usage
+- Per-VM CPU and memory usage
+- Network traffic
+- Disk I/O
+- VM/Container status table
+- Storage pool usage
+- Container resource usage
+
+**Best For**: Virtualization management, VM performance, capacity planning
+
+**Key Components**:
+- Host Health (status, resources)
+- VM Metrics (CPU, memory per VM)
+- Container Metrics (LXC resources)
+- Storage Monitoring
+- Network & I/O Performance
+- Guest Status Table
+
+**Requires**:
+- Proxmox VE deployed (x86-64 only)
+- pve-exporter or similar Prometheus exporter
+- Node Exporter on Proxmox host
+
+**Note**: Proxmox VE is x86-64 only (Odroid H4), not available on ARM64 platforms
+
+---
+
 ## Dashboard Usage Patterns
 
 ### Morning Briefing
@@ -386,7 +452,7 @@ Future dashboards to consider:
 
 ---
 
-**Last Updated**: 2025-11-10
+**Last Updated**: 2025-11-11
 **Status**: Production Ready
-**Total Dashboards**: 9
-**Metrics Covered**: 50+
+**Total Dashboards**: 11
+**Metrics Covered**: 75+
